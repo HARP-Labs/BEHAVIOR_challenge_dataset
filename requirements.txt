@@ -1,1 +1,7 @@
-# Add project dependencies here.
+huggingface_hub[hf_xet]
+datasets
+pandas
+pyarrow
+tqdm
+lerobot
+opencv-python
