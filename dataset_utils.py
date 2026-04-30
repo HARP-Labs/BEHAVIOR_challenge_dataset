@@ -2,6 +2,7 @@ import yaml
 import os
 import logging
 import json
+from pathlib import Path
 from datasets import load_dataset
 from huggingface_hub import hf_hub_download, snapshot_download
 
@@ -85,3 +86,10 @@ def load_jsonl_file(file_path):
             if line:
                 data.append(json.loads(line))
     return data
+
+
+def save_json_file(file_path, data):
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)

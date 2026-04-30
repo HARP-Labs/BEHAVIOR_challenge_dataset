@@ -7,6 +7,7 @@ from .dataset_utils import (
     load_from_huggingface,
     load_json_file,
     load_jsonl_file,
+    save_json_file,
     load_yaml_config,
     logger,
 )
@@ -119,6 +120,7 @@ class BaseDataset:
 
         if found_count == total_count:
             self.selected_meta = self._build_selected_meta()
+            self._log_metadata_preview()
         else:
             self.selected_meta = None
 
@@ -196,7 +198,22 @@ class BaseDataset:
             f"Selected {len(selected)} episodes totaling {selected_hours:.3f}h "
             f"(target={target_hours:.3f}h)."
         )
+        save_json_file("output/meta.json", selected_meta)
+        self.logger.info("Saved selected metadata to output/meta.json")
         return selected_meta
+
+    def _log_metadata_preview(self) -> None:
+        tasks_count = len(self.tasks) if isinstance(self.tasks, list) else 0
+        episodes_count = len(self.episodes) if isinstance(self.episodes, list) else 0
+        selected_count = (
+            len(self.selected_meta.get("episodes", []))
+            if isinstance(self.selected_meta, dict)
+            else 0
+        )
+        self.logger.info(
+            f"Metadata preview: info_keys={list(self.info.keys())[:8] if isinstance(self.info, dict) else []}, "
+            f"tasks={tasks_count}, episodes={episodes_count}, selected={selected_count}"
+        )
 
     def _episode_task_name(self, episode: dict[str, Any]) -> str:
         return (
