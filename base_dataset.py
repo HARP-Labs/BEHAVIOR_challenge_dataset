@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import random
+import re
+import time
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 from .dataset_utils import (
     episode_duration_minutes,
@@ -194,10 +198,83 @@ class BaseDataset:
         if not output_dir or str(output_dir).lower() in {"none", "null"}:
             output_dir = "output"
 
-        metadata_file = Path(output_dir) / "meta.json"
+        metadata_file = Path(output_dir) / "manifest.json"
         save_json_file(str(metadata_file), selected_meta)
         self.logger.info(f"Saved selected metadata to {metadata_file.resolve()}")
+        self._download_selected_episodes(selected_meta)
         return selected_meta
+
+    def _download_selected_episodes(self, selected_meta: dict[str, Any]) -> None:
+        """
+        Download all files referenced by the selected manifest and store them
+        in a LeRobot-like directory layout per task:
+          <base_dataset_destination>/<task>/data
+          <base_dataset_destination>/<task>/video
+          <base_dataset_destination>/<task>/meta
+        """
+        episodes = selected_meta.get("episodes", [])
+        if not episodes:
+            self.logger.warning("No selected episodes available; skipping downloads.")
+            return
+
+        output_dir = Path(self.base_dataset_destination or "output")
+        files_to_download: list[tuple[Path, str, str]] = []
+
+        for episode in episodes:
+            task_name = str(episode.get("task_name") or episode.get("task") or "unknown_task")
+            safe_task_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", task_name).strip("_") or "unknown_task"
+            task_root = output_dir / safe_task_name
+
+            data_rel = episode.get("data_parquet_file")
+            if data_rel:
+                files_to_download.append((task_root / "data", str(data_rel), "data"))
+
+            episode_rel = episode.get("episode_file")
+            if episode_rel:
+                files_to_download.append((task_root / "meta", str(episode_rel), "meta"))
+
+            for video_rel in episode.get("video_files", []):
+                files_to_download.append((task_root / "video", str(video_rel), "video"))
+
+        found_files = 0
+        missing_files = 0
+        bytes_downloaded = 0
+        download_start = time.time()
+
+        for local_dir, remote_path, category in tqdm(
+            files_to_download,
+            desc="Downloading selected episode files",
+            unit="file",
+        ):
+            try:
+                downloaded_path = load_from_huggingface(
+                    self.repo_id,
+                    file_path=remote_path,
+                    use_hub_download=True,
+                    token=self.token,
+                    local_dir=str(local_dir),
+                    local_dir_use_symlinks=False,
+                    **self.kwargs,
+                )
+                file_size = Path(downloaded_path).stat().st_size
+                bytes_downloaded += file_size
+                found_files += 1
+            except Exception as exc:
+                missing_files += 1
+                self.logger.warning(f"Failed to download [{category}] {remote_path}: {exc}")
+
+        elapsed_seconds = time.time() - download_start
+        gib_downloaded = bytes_downloaded / (1024 ** 3)
+        total_files = len(files_to_download)
+        all_found = found_files == total_files
+
+        self.logger.info("Download summary")
+        self.logger.info(
+            f"  files found: {found_files}/{total_files} (all_found={all_found})"
+        )
+        self.logger.info(f"  missing files: {missing_files}")
+        self.logger.info(f"  downloaded size: {gib_downloaded:.3f} GiB")
+        self.logger.info(f"  download time: {elapsed_seconds:.2f} seconds")
    
     def _log_metadata_preview(self) -> None:
         """Log selected-episode counts and per-task duration-weighted contributions."""
