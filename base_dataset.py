@@ -130,6 +130,7 @@ class BaseDataset:
         return loaded_meta
 
     def _build_selected_meta(self) -> dict[str, Any]:
+        """Sample episodes per task and persist selected metadata to disk."""
         rng = random.Random(self.seed)
         target_hours = float(self.dataset_size)
         eval_task_set = set(self.eval_tasks)
@@ -243,6 +244,7 @@ class BaseDataset:
     def _build_episode_task_lookups(
         self,
     ) -> tuple[dict[int, dict[str, Any]], dict[str, list[int]], dict[str, dict[str, Any]]]:
+        """Build lookup maps for episodes and task metadata relationships."""
         task_lookup: dict[str, dict[str, Any]] = {}
         for task in self.tasks:
             description = task.get("task")
@@ -275,6 +277,7 @@ class BaseDataset:
     def _log_task_episode_link_summary(
         self, task_lookup: dict[str, dict[str, Any]], episodes_by_task_desc: dict[str, list[int]]
     ) -> None:
+        """Log high-level statistics for task-to-episode link coverage."""
         task_episode_counts = {
             task_desc: len(episodes_by_task_desc.get(task_desc, []))
             for task_desc in task_lookup
@@ -294,6 +297,7 @@ class BaseDataset:
         duration_minutes: float,
         episode: dict[str, Any],
     ) -> dict[str, Any]:
+        """Construct a normalized selected-episode metadata record."""
         episode_chunk = sampled_id // int(self.info["chunks_size"])
         path_vars = {"episode_chunk": episode_chunk, "episode_index": sampled_id}
         data_parquet_file = self.info["data_path"].format(**path_vars)
