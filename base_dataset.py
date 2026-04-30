@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from huggingface_hub import HfApi
+from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 from tqdm import tqdm
 
 from .dataset_utils import (
@@ -238,6 +239,7 @@ class BaseDataset:
 
         previous_disable_pb = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        disable_progress_bars()
         try:
             for local_dir, remote_path, category in files_to_download:
                 try:
@@ -263,6 +265,7 @@ class BaseDataset:
                         progress.update(1)
         finally:
             progress.close()
+            enable_progress_bars()
             if previous_disable_pb is None:
                 os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
             else:
