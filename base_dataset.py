@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from huggingface_hub import HfApi
 from tqdm import tqdm
 
 from .dataset_utils import (
@@ -241,11 +242,35 @@ class BaseDataset:
         bytes_downloaded = 0
         download_start = time.time()
 
-        for local_dir, remote_path, category in tqdm(
-            files_to_download,
-            desc="Downloading selected episode files",
-            unit="file",
-        ):
+        file_sizes_by_path: dict[str, int] = {}
+        try:
+            repo_info = HfApi(token=self.token).repo_info(
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                files_metadata=True,
+            )
+            for sibling in getattr(repo_info, "siblings", []) or []:
+                sibling_path = getattr(sibling, "rfilename", None)
+                sibling_size = getattr(sibling, "size", None)
+                if sibling_path and isinstance(sibling_size, int):
+                    file_sizes_by_path[str(sibling_path)] = sibling_size
+        except Exception as exc:
+            self.logger.warning(f"Could not fetch remote file sizes for global ETA: {exc}")
+
+        estimated_total_bytes = sum(file_sizes_by_path.get(path, 0) for _, path, _ in files_to_download)
+        has_size_estimate = estimated_total_bytes > 0
+        progress_unit = "B" if has_size_estimate else "file"
+        progress_total = estimated_total_bytes if has_size_estimate else len(files_to_download)
+
+        progress = tqdm(
+            total=progress_total,
+            desc="Downloading selected episode files (global)",
+            unit=progress_unit,
+            unit_scale=has_size_estimate,
+            unit_divisor=1024,
+        )
+
+        for local_dir, remote_path, category in files_to_download:
             try:
                 downloaded_path = load_from_huggingface(
                     self.repo_id,
@@ -259,9 +284,17 @@ class BaseDataset:
                 file_size = Path(downloaded_path).stat().st_size
                 bytes_downloaded += file_size
                 found_files += 1
+                if has_size_estimate:
+                    progress.update(file_sizes_by_path.get(remote_path, file_size))
+                else:
+                    progress.update(1)
             except Exception as exc:
                 missing_files += 1
                 self.logger.warning(f"Failed to download [{category}] {remote_path}: {exc}")
+                if not has_size_estimate:
+                    progress.update(1)
+
+        progress.close()
 
         elapsed_seconds = time.time() - download_start
         gib_downloaded = bytes_downloaded / (1024 ** 3)
