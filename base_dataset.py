@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
-from .dataset_utils import load_from_huggingface, load_yaml_config, logger
+from .dataset_utils import (
+    load_from_huggingface,
+    load_json_file,
+    load_jsonl_file,
+    load_yaml_config,
+    logger,
+)
 
 
 class BaseDataset:
@@ -62,20 +66,7 @@ class BaseDataset:
         self.logger.info(f"BaseDataset config: {config_preview}")
 
         # Build base dataset state immediately after initialization.
-        self.meta = self.build_base_dataset()
-
-    def _read_json_file(self, local_path: str | Path) -> Any:
-        with open(local_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    def _read_jsonl_file(self, local_path: str | Path) -> list[dict[str, Any]]:
-        data: list[dict[str, Any]] = []
-        with open(local_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    data.append(json.loads(line))
-        return data
+        self.build_base_dataset()
 
     def build_base_dataset(self) -> dict[str, Any]:
         """
@@ -84,12 +75,16 @@ class BaseDataset:
         Returns:
             dict[str, Any]: dictionary containing parsed file contents keyed by filename.
         """
-        required_meta_files = ["meta/info.json", "meta/tasks.jsonl", "meta/episodes.jsonl"]
-        loaded_meta: dict[str, Any] = {}
+        required_meta_files = {
+            "info": "meta/info.json",
+            "tasks": "meta/tasks.jsonl",
+            "episodes": "meta/episodes.jsonl",
+        }
+        loaded_meta: dict[str, Any] = {"info": None, "tasks": None, "episodes": None}
 
         self.logger.info("Building base dataset: loading required metadata files from /meta.")
 
-        for file_path in required_meta_files:
+        for key, file_path in required_meta_files.items():
             try:
                 local_path = load_from_huggingface(
                     self.repo_id,
@@ -100,19 +95,23 @@ class BaseDataset:
                 )
 
                 if file_path.endswith(".json"):
-                    parsed = self._read_json_file(local_path)
+                    parsed = load_json_file(local_path)
                 else:
-                    parsed = self._read_jsonl_file(local_path)
+                    parsed = load_jsonl_file(local_path)
 
-                loaded_meta[file_path] = parsed
+                loaded_meta[key] = parsed
             except Exception as exc:
                 self.logger.warning(f"Missing or unreadable: {file_path} ({exc})")
 
-        found_count = len(loaded_meta)
+        self.info = loaded_meta["info"]
+        self.tasks = loaded_meta["tasks"]
+        self.episodes = loaded_meta["episodes"]
+
+        found_count = len([v for v in loaded_meta.values() if v is not None])
         total_count = len(required_meta_files)
         self.logger.info(
             f"Base dataset metadata loaded: {found_count}/{total_count} files found "
-            f"({', '.join(sorted(loaded_meta.keys()))})"
+            f"(info={self.info is not None}, tasks={self.tasks is not None}, episodes={self.episodes is not None})"
         )
 
         return loaded_meta
