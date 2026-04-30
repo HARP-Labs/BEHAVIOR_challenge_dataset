@@ -54,7 +54,7 @@ class BaseDataset:
             "camera": self.camera_view_type,
             "size": self.dataset_size,
             "eval_tasks": len(self.eval_tasks),
-            "exclude_eval_tasks": len(self.exclude_eval_tasks),
+            "exclude_eval_tasks": self.exclude_eval_tasks,
             "include_eval_tasks_fully": self.include_eval_tasks_fully,
             "obs_resolution": self.obs_resolution,
             "fps": self.fps,
