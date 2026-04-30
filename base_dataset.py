@@ -199,7 +199,6 @@ class BaseDataset:
         return selected_meta
    
     def _log_metadata_preview(self) -> None:
-        info_keys = list(self.info.keys())[:8] if isinstance(self.info, dict) else []
         tasks_count = len(self.tasks) if isinstance(self.tasks, list) else 0
         episodes_count = len(self.episodes) if isinstance(self.episodes, list) else 0
         selected_episodes = (
@@ -221,9 +220,8 @@ class BaseDataset:
             )
 
         self.logger.info("Metadata preview:")
-        self.logger.info(f"  info_keys={info_keys}")
         self.logger.info(
-            f"  counts: tasks={tasks_count}, episodes={episodes_count}, selected={selected_count}"
+            f"  counts: tasks={tasks_count}, episodes={episodes_count}, selected:episodes={selected_count}"
         )
         self.logger.info(f"  task_contributions: [{contribution_summary}]")
 
