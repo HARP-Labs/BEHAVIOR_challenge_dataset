@@ -1,6 +1,7 @@
 import yaml
 import os
 import logging
+import json
 from datasets import load_dataset
 from huggingface_hub import hf_hub_download, snapshot_download
 
@@ -62,3 +63,18 @@ def load_from_huggingface(
             )
         return hf_hub_download(repo_id=repo_id, filename=file_path, token=token, **kwargs)
     return load_dataset(repo_id, **kwargs)
+
+
+def load_json_file(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_jsonl_file(file_path):
+    data = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                data.append(json.loads(line))
+    return data
