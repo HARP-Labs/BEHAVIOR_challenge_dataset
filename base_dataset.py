@@ -159,7 +159,10 @@ class BaseDataset:
             for task_desc in (episode.get("tasks") or []):
                 if task_desc in task_lookup:
                     episodes_by_task_desc.setdefault(task_desc, []).append(int(episode_id))
-        task_episode_counts = {task_desc: len(ids) for task_desc, ids in episodes_by_task_desc.items()}
+        task_episode_counts = {
+            task_desc: len(episodes_by_task_desc.get(task_desc, []))
+            for task_desc in task_lookup
+        }
         total_task_episode_links = sum(task_episode_counts.values())
         self.logger.info(
             f"Found episode links for {len(task_episode_counts)}/{len(task_lookup)} tasks; "
@@ -190,15 +193,22 @@ class BaseDataset:
                 episode_file = self.info["metainfo_path"].format(**path_vars)
  
                 if self.camera_view_type == "all":
-                    video_key = "observation.images.rgb.head"
+                    video_keys = [
+                        "observation.images.rgb.head",
+                        "observation.images.rgb.left_wrist",
+                        "observation.images.rgb.right_wrist",
+                    ]
                 elif self.camera_view_type in {"head", "left_wrist", "right_wrist"}:
-                    video_key = f"observation.images.rgb.{self.camera_view_type}"
+                    video_keys = [f"observation.images.rgb.{self.camera_view_type}"]
                 else:
                     raise ValueError(
                         f"Unsupported camera_view_type '{self.camera_view_type}'. "
                         "Expected one of: all, head, left_wrist, right_wrist."
                     )
-                video_file = self.info["video_path"].format(**(path_vars | {"video_key": video_key}))
+                video_files = [
+                    self.info["video_path"].format(**(path_vars | {"video_key": video_key}))
+                    for video_key in video_keys
+                ]
                 annotation_file = self.info["annotation_path"].format(**path_vars)
 
                 length = float(episode.get("length", 0.0))
@@ -213,7 +223,8 @@ class BaseDataset:
                         "task_index": task_meta.get("task_index"),
                         "episode_index": sampled_id,
                         "duration_hours": duration_hours,
-                        "video_file": video_file,
+                        "video_file": video_files[0],
+                        "video_files": video_files,
                         "data_parquet_file": data_parquet_file,
                         "episode_file": episode_file,
                         "annotation_file": annotation_file,
@@ -236,8 +247,9 @@ class BaseDataset:
             f"Selected {len(selected)} episodes totaling {selected_hours:.3f}h "
             f"(target={target_hours:.3f}h, per_task_budget={per_task_budget_hours:.3f}h)."
         )
-        save_json_file("output/meta.json", selected_meta)
-        self.logger.info("Saved selected metadata to output/meta.json")
+        metadata_file = "output/meta.json"
+        save_json_file(metadata_file, selected_meta)
+        self.logger.info(f"Saved selected metadata to {metadata_file}")
         return selected_meta
 
     def _log_metadata_preview(self) -> None:
