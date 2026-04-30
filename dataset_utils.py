@@ -74,11 +74,13 @@ def load_from_huggingface(
 
 
 def load_json_file(file_path):
+    """Load and return JSON content from a UTF-8 encoded file path."""
     with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def load_jsonl_file(file_path):
+    """Load a JSONL file and return a list of parsed JSON objects."""
     data = []
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -89,6 +91,7 @@ def load_jsonl_file(file_path):
 
 
 def save_json_file(file_path, data):
+    """Save JSON-serializable data to disk, creating parent directories as needed."""
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -106,6 +109,7 @@ def episode_task_name(episode):
 
 
 def episode_duration_minutes(episode, fps=None):
+    """Return an episode duration in minutes from available duration fields."""
     if "duration_minutes" in episode:
         return float(episode["duration_minutes"])
     if "duration_seconds" in episode:
