@@ -1,8 +1,10 @@
 import yaml
 import os
 import logging
+import json
+from pathlib import Path
 from datasets import load_dataset
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 
 
 # --- Logging setup: module-level logger with console handler and formatter ---
@@ -33,7 +35,12 @@ def load_yaml_config(config_filename):
 
 
 def load_from_huggingface(
-    repo_id, file_path=None, use_hub_download=False, token=None, **kwargs
+    repo_id,
+    file_path=None,
+    use_hub_download=False,
+    token=None,
+    download_mode="single_file",
+    **kwargs,
 ):
     """
     Load a dataset or file from a Hugging Face dataset repository.
@@ -48,10 +55,41 @@ def load_from_huggingface(
         Loaded dataset or local file path.
     """
     if use_hub_download and file_path:
-        logger.info(
-            f"Downloading file '{file_path}' from repo '{repo_id}' via huggingface_hub."
+        if download_mode == "snapshot":
+            return snapshot_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                token=token,
+                allow_patterns=file_path,
+                **kwargs,
+            )
+        return hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename=file_path,
+            token=token,
+            **kwargs,
         )
-        return hf_hub_download(repo_id=repo_id, filename=file_path, token=token)
-    else:
-        logger.info(f"Loading dataset '{repo_id}' via datasets.load_dataset.")
-        return load_dataset(repo_id, **kwargs)
+    return load_dataset(repo_id, **kwargs)
+
+
+def load_json_file(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_jsonl_file(file_path):
+    data = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                data.append(json.loads(line))
+    return data
+
+
+def save_json_file(file_path, data):
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
