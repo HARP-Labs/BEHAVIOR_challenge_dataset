@@ -31,6 +31,7 @@ class BaseDataset:
         # Explicitly set each attribute from config (no fallbacks)
         self.camera_view_type = self.dataset_cfg["camera_view_type"]
         self.dataset_size = self.dataset_cfg["dataset_size"]
+        self.seed = self.dataset_cfg["seed"]
         self.eval_tasks = self.dataset_cfg["eval_tasks"]
         self.exclude_eval_tasks = self.dataset_cfg["exclude_eval_tasks"]
         self.include_eval_tasks_fully = self.dataset_cfg["include_eval_tasks_fully"]
@@ -54,6 +55,7 @@ class BaseDataset:
         config_preview = {
             "camera": self.camera_view_type,
             "size": self.dataset_size,
+            "seed": self.seed,
             "eval_tasks": len(self.eval_tasks),
             "exclude_eval_tasks": self.exclude_eval_tasks,
             "include_eval_tasks_fully": self.include_eval_tasks_fully,
@@ -128,7 +130,7 @@ class BaseDataset:
                 "Invalid config: exclude_eval_tasks and include_eval_tasks_fully cannot both be True."
             )
 
-        rng = random.Random(42)
+        rng = random.Random(self.seed)
         target_hours = float(self.dataset_size)
         eval_task_set = set(self.eval_tasks)
 
