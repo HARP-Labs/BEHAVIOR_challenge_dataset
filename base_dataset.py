@@ -220,55 +220,20 @@ class BaseDataset:
             return
 
         output_dir = Path(self.base_dataset_destination or "output")
-        files_to_download: list[tuple[Path, str, str]] = []
-
-        for episode in episodes:
-            task_name = str(episode.get("task_name") or episode.get("task") or "unknown_task")
-            safe_task_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", task_name).strip("_") or "unknown_task"
-            task_root = output_dir / safe_task_name
-
-            data_rel = episode.get("data_parquet_file")
-            if data_rel:
-                files_to_download.append((task_root / "data", str(data_rel), "data"))
-
-            episode_rel = episode.get("episode_file")
-            if episode_rel:
-                files_to_download.append((task_root / "meta", str(episode_rel), "meta"))
-
-            for video_rel in episode.get("video_files", []):
-                files_to_download.append((task_root / "video", str(video_rel), "video"))
+        files_to_download = self._build_download_targets(episodes, output_dir)
 
         found_files = 0
         missing_files = 0
         bytes_downloaded = 0
         download_start = time.time()
 
-        file_sizes_by_path: dict[str, int] = {}
-        try:
-            repo_info = HfApi(token=self.token).repo_info(
-                repo_id=self.repo_id,
-                repo_type="dataset",
-                files_metadata=True,
-            )
-            for sibling in getattr(repo_info, "siblings", []) or []:
-                sibling_path = getattr(sibling, "rfilename", None)
-                sibling_size = getattr(sibling, "size", None)
-                if sibling_path and isinstance(sibling_size, int):
-                    file_sizes_by_path[str(sibling_path)] = sibling_size
-        except Exception as exc:
-            self.logger.warning(f"Could not fetch remote file sizes for global ETA: {exc}")
-
+        file_sizes_by_path = self._fetch_remote_file_sizes()
         estimated_total_bytes = sum(file_sizes_by_path.get(path, 0) for _, path, _ in files_to_download)
         has_size_estimate = estimated_total_bytes > 0
-        progress_unit = "B" if has_size_estimate else "file"
-        progress_total = estimated_total_bytes if has_size_estimate else len(files_to_download)
-
-        progress = tqdm(
-            total=progress_total,
-            desc="Downloading selected episode files (global)",
-            unit=progress_unit,
-            unit_scale=has_size_estimate,
-            unit_divisor=1024,
+        progress = self._create_global_download_progress(
+            total_bytes=estimated_total_bytes,
+            total_files=len(files_to_download),
+            has_size_estimate=has_size_estimate,
         )
 
         previous_disable_pb = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
@@ -315,6 +280,65 @@ class BaseDataset:
         self.logger.info(f"  missing files: {missing_files}")
         self.logger.info(f"  downloaded size: {gib_downloaded:.3f} GiB")
         self.logger.info(f"  download time: {elapsed_seconds:.2f} seconds")
+
+    def _build_download_targets(
+        self,
+        episodes: list[dict[str, Any]],
+        output_dir: Path,
+    ) -> list[tuple[Path, str, str]]:
+        """Build local/remote/category download targets for selected episodes."""
+        files_to_download: list[tuple[Path, str, str]] = []
+        for episode in episodes:
+            task_name = str(episode.get("task_name") or episode.get("task") or "unknown_task")
+            safe_task_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", task_name).strip("_") or "unknown_task"
+            task_root = output_dir / safe_task_name
+
+            data_rel = episode.get("data_parquet_file")
+            if data_rel:
+                files_to_download.append((task_root / "data", str(data_rel), "data"))
+
+            episode_rel = episode.get("episode_file")
+            if episode_rel:
+                files_to_download.append((task_root / "meta", str(episode_rel), "meta"))
+
+            for video_rel in episode.get("video_files", []):
+                files_to_download.append((task_root / "video", str(video_rel), "video"))
+        return files_to_download
+
+    def _fetch_remote_file_sizes(self) -> dict[str, int]:
+        """Fetch remote dataset file sizes keyed by relative repo path."""
+        file_sizes_by_path: dict[str, int] = {}
+        try:
+            repo_info = HfApi(token=self.token).repo_info(
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                files_metadata=True,
+            )
+            for sibling in getattr(repo_info, "siblings", []) or []:
+                sibling_path = getattr(sibling, "rfilename", None)
+                sibling_size = getattr(sibling, "size", None)
+                if sibling_path and isinstance(sibling_size, int):
+                    file_sizes_by_path[str(sibling_path)] = sibling_size
+        except Exception as exc:
+            self.logger.warning(f"Could not fetch remote file sizes for global ETA: {exc}")
+        return file_sizes_by_path
+
+    def _create_global_download_progress(
+        self,
+        total_bytes: int,
+        total_files: int,
+        has_size_estimate: bool,
+    ) -> tqdm:
+        """Create the single global tqdm progress bar for selected-file downloads."""
+        progress_unit = "B" if has_size_estimate else "file"
+        progress_total = total_bytes if has_size_estimate else total_files
+        return tqdm(
+            total=progress_total,
+            desc="Downloading selected episode files (global)",
+            unit=progress_unit,
+            unit_scale=has_size_estimate,
+            unit_divisor=1024,
+        )
    
     def _log_metadata_preview(self) -> None:
         """Log selected-episode counts and per-task duration-weighted contributions."""
