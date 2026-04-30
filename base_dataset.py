@@ -197,7 +197,6 @@ class BaseDataset:
                         "video_file": video_file,
                         "data_parquet_file": data_parquet_file,
                         "episode_file": episode_file,
-                        "annotation_file": annotation_file,
                         "raw": episode,
                     }
                 )
