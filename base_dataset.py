@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from pathlib import Path
 from typing import Any
 
 from .dataset_utils import (
@@ -192,7 +193,7 @@ class BaseDataset:
                 data_parquet_file = self.info["data_path"].format(**path_vars)
                 episode_file = self.info["metainfo_path"].format(**path_vars)
  
-                if self.camera_view_type == "all":
+                if self.camera_view_type in {"all", "multi"}:
                     video_keys = [
                         "observation.images.rgb.head",
                         "observation.images.rgb.left_wrist",
@@ -247,9 +248,13 @@ class BaseDataset:
             f"Selected {len(selected)} episodes totaling {selected_hours:.3f}h "
             f"(target={target_hours:.3f}h, per_task_budget={per_task_budget_hours:.3f}h)."
         )
-        metadata_file = "output/meta.json"
-        save_json_file(metadata_file, selected_meta)
-        self.logger.info(f"Saved selected metadata to {metadata_file}")
+        output_dir = self.base_dataset_destination
+        if not output_dir or str(output_dir).lower() in {"none", "null"}:
+            output_dir = "output"
+
+        metadata_file = Path(output_dir) / "meta.json"
+        save_json_file(str(metadata_file), selected_meta)
+        self.logger.info(f"Saved selected metadata to {metadata_file.resolve()}")
         return selected_meta
 
     def _log_metadata_preview(self) -> None:
