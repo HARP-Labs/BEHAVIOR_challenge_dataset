@@ -93,3 +93,24 @@ def save_json_file(file_path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def episode_task_name(episode):
+    return (
+        episode.get("task")
+        or episode.get("task_name")
+        or episode.get("task_id")
+        or "unknown_task"
+    )
+
+
+def episode_duration_minutes(episode, fps=None):
+    if "duration_minutes" in episode:
+        return float(episode["duration_minutes"])
+    if "duration_seconds" in episode:
+        return float(episode["duration_seconds"]) / 60.0
+    if "duration_hours" in episode:
+        return float(episode["duration_hours"]) * 60.0
+    if "num_frames" in episode and fps:
+        return float(episode["num_frames"]) / float(fps) / 60.0
+    return 0.0

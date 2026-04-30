@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from .dataset_utils import (
+    episode_duration_minutes,
+    episode_task_name,
     load_from_huggingface,
     load_json_file,
     load_jsonl_file,
@@ -135,43 +137,9 @@ class BaseDataset:
         fps = float(self.info.get("fps", 30.0))
         total_tasks = int(self.info.get("total_tasks", 50))
         per_task_budget_hours = target_hours / float(total_tasks)
+        episode_index_lookup, episodes_by_task_desc, task_lookup = self._build_episode_task_lookups()
+        self._log_task_episode_link_summary(task_lookup, episodes_by_task_desc)
 
-        task_lookup: dict[str, dict[str, Any]] = {}
-        for task in self.tasks:
-            description = task.get("task")
-            if description:
-                task_lookup[description] = {
-                    "task_index": task.get("task_index"),
-                    "task_name": task.get("task_name"),
-                    "task": description,
-                }
-        expected_total_tasks = int(self.info.get("total_tasks", 50))
-        if len(task_lookup) != expected_total_tasks:
-            raise ValueError(
-                f"Expected {expected_total_tasks} tasks in tasks metadata, found {len(task_lookup)}."
-            )
-
-        episode_index_lookup: dict[int, dict[str, Any]] = {}
-        episodes_by_task_desc: dict[str, list[int]] = {}
-        for episode in self.episodes:
-            episode_id = episode.get("episode_index")
-            if episode_id is None:
-                self.logger.warning("Encountered episode entry without episode_index; skipping.")
-                continue
-            episode_index_lookup[int(episode_id)] = episode
-            for task_desc in (episode.get("tasks") or []):
-                if task_desc in task_lookup:
-                    episodes_by_task_desc.setdefault(task_desc, []).append(int(episode_id))
-        task_episode_counts = {
-            task_desc: len(episodes_by_task_desc.get(task_desc, []))
-            for task_desc in task_lookup
-        }
-        total_task_episode_links = sum(task_episode_counts.values())
-        self.logger.info(
-            f"Found episode links for {len(task_episode_counts)}/{len(task_lookup)} tasks; "
-            f"total task-episode links={total_task_episode_links}."
-        )
-        
         selected: list[dict[str, Any]] = []
         selected_hours = 0.0
 
@@ -190,48 +158,20 @@ class BaseDataset:
                 if not episode:
                     continue
 
-                episode_chunk = sampled_id // int(self.info["chunks_size"])
-                path_vars = {"episode_chunk": episode_chunk, "episode_index": sampled_id}
-                data_parquet_file = self.info["data_path"].format(**path_vars)
-                episode_file = self.info["metainfo_path"].format(**path_vars)
- 
-                if self.camera_view_type in {"all"}:
-                    video_keys = [
-                        "observation.images.rgb.head",
-                        "observation.images.rgb.left_wrist",
-                        "observation.images.rgb.right_wrist",
-                    ]
-                elif self.camera_view_type in {"head", "left_wrist", "right_wrist"}:
-                    video_keys = [f"observation.images.rgb.{self.camera_view_type}"]
-                else:
-                    raise ValueError(
-                        f"Unsupported camera_view_type '{self.camera_view_type}'. "
-                        "Expected one of: all, head, left_wrist, right_wrist."
-                    )
-                video_files = [
-                    self.info["video_path"].format(**(path_vars | {"video_key": video_key}))
-                    for video_key in video_keys
-                ]
-
-                length = float(episode.get("length", 0.0))
-                duration_minutes = (length / fps) / 60.0 # lets compute in minutes 
+                duration_minutes = episode_duration_minutes(episode, fps)
                 duration_hours = duration_minutes / 60.0
                 if duration_hours <= 0:
                     continue
 
                 selected.append(
-                    {
-                        "task": task_desc,
-                        "task_name": task_name,
-                        "task_index": task_meta.get("task_index"),
-                        "episode_index": sampled_id,
-                        "duration_minutes": duration_minutes,
-                        "video_file": video_files[0],
-                        "video_files": video_files,
-                        "data_parquet_file": data_parquet_file,
-                        "episode_file": episode_file,
-                        "raw": episode,
-                    }
+                    self._build_selected_episode_entry(
+                        task_desc=task_desc,
+                        task_name=task_name,
+                        task_index=task_meta.get("task_index"),
+                        sampled_id=sampled_id,
+                        duration_minutes=duration_minutes,
+                        episode=episode,
+                    )
                 )
                 remaining_budget_hours -= duration_hours
                 selected_hours += duration_hours
@@ -269,7 +209,7 @@ class BaseDataset:
 
         task_totals: dict[str, int] = {}
         for episode in selected_episodes if isinstance(selected_episodes, list) else []:
-            task_name = str(episode.get("task_name") or episode.get("task") or "unknown_task")
+            task_name = str(episode_task_name(episode))
             task_totals[task_name] = task_totals.get(task_name, 0) + 1
 
         contribution_summary = "none"
@@ -288,21 +228,92 @@ class BaseDataset:
         self.logger.info(f"  task_contributions: [{contribution_summary}]")
 
 
-    def _episode_task_name(self, episode: dict[str, Any]) -> str:
-        return (
-            episode.get("task")
-            or episode.get("task_name")
-            or episode.get("task_id")
-            or "unknown_task"
+    def _build_episode_task_lookups(
+        self,
+    ) -> tuple[dict[int, dict[str, Any]], dict[str, list[int]], dict[str, dict[str, Any]]]:
+        task_lookup: dict[str, dict[str, Any]] = {}
+        for task in self.tasks:
+            description = task.get("task")
+            if description:
+                task_lookup[description] = {
+                    "task_index": task.get("task_index"),
+                    "task_name": task.get("task_name"),
+                    "task": description,
+                }
+        expected_total_tasks = int(self.info.get("total_tasks", 50))
+        if len(task_lookup) != expected_total_tasks:
+            raise ValueError(
+                f"Expected {expected_total_tasks} tasks in tasks metadata, found {len(task_lookup)}."
+            )
+
+        episode_index_lookup: dict[int, dict[str, Any]] = {}
+        episodes_by_task_desc: dict[str, list[int]] = {}
+        for episode in self.episodes:
+            episode_id = episode.get("episode_index")
+            if episode_id is None:
+                self.logger.warning("Encountered episode entry without episode_index; skipping.")
+                continue
+            episode_index_lookup[int(episode_id)] = episode
+            for task_desc in (episode.get("tasks") or []):
+                if task_desc in task_lookup:
+                    episodes_by_task_desc.setdefault(task_desc, []).append(int(episode_id))
+
+        return episode_index_lookup, episodes_by_task_desc, task_lookup
+
+    def _log_task_episode_link_summary(
+        self, task_lookup: dict[str, dict[str, Any]], episodes_by_task_desc: dict[str, list[int]]
+    ) -> None:
+        task_episode_counts = {
+            task_desc: len(episodes_by_task_desc.get(task_desc, []))
+            for task_desc in task_lookup
+        }
+        total_task_episode_links = sum(task_episode_counts.values())
+        self.logger.info(
+            f"Found episode links for {len(task_episode_counts)}/{len(task_lookup)} tasks; "
+            f"total task-episode links={total_task_episode_links}."
         )
 
-    def _episode_duration_minutes(self, episode: dict[str, Any]) -> float:
-        if "duration_minutes" in episode:
-            return float(episode["duration_minutes"])
-        if "duration_seconds" in episode:
-            return float(episode["duration_seconds"]) / 60.0
-        if "duration_hours" in episode:
-            return float(episode["duration_hours"]) * 60.0
-        if "num_frames" in episode and self.fps:
-            return float(episode["num_frames"]) / float(self.fps) / 60.0
-        return 0.0
+    def _build_selected_episode_entry(
+        self,
+        task_desc: str,
+        task_name: str | None,
+        task_index: int | None,
+        sampled_id: int,
+        duration_minutes: float,
+        episode: dict[str, Any],
+    ) -> dict[str, Any]:
+        episode_chunk = sampled_id // int(self.info["chunks_size"])
+        path_vars = {"episode_chunk": episode_chunk, "episode_index": sampled_id}
+        data_parquet_file = self.info["data_path"].format(**path_vars)
+        episode_file = self.info["metainfo_path"].format(**path_vars)
+
+        if self.camera_view_type in {"all"}:
+            video_keys = [
+                "observation.images.rgb.head",
+                "observation.images.rgb.left_wrist",
+                "observation.images.rgb.right_wrist",
+            ]
+        elif self.camera_view_type in {"head", "left_wrist", "right_wrist"}:
+            video_keys = [f"observation.images.rgb.{self.camera_view_type}"]
+        else:
+            raise ValueError(
+                f"Unsupported camera_view_type '{self.camera_view_type}'. "
+                "Expected one of: all, head, left_wrist, right_wrist."
+            )
+        video_files = [
+            self.info["video_path"].format(**(path_vars | {"video_key": video_key}))
+            for video_key in video_keys
+        ]
+
+        return {
+            "task": task_desc,
+            "task_name": task_name,
+            "task_index": task_index,
+            "episode_index": sampled_id,
+            "duration_minutes": duration_minutes,
+            "video_file": video_files[0],
+            "video_files": video_files,
+            "data_parquet_file": data_parquet_file,
+            "episode_file": episode_file,
+            "raw": episode,
+        }
