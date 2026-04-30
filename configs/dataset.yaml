@@ -5,7 +5,6 @@ dataset:
   seed: 42 # random seed used for deterministic episode sampling
   eval_tasks: ["outfit_a_basic_toolbox"] # the task wihc shall completely included into the dataset
   exclude_eval_tasks: True # exclude the eval task from the dataset completely 
-  include_eval_tasks_fully: False # includes all eval tasks fully then uniformly samples from all other tasks. If True exclude_eval_tasks cannot be true and all eval taks have to be fitting in the dataset_size
   obs_resolution: 256 # 256x256 RGB only support 
   fps: 5 # fps for downsampling
   shard_size: 1 # in GiB
