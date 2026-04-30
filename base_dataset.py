@@ -199,6 +199,7 @@ class BaseDataset:
         return selected_meta
    
     def _log_metadata_preview(self) -> None:
+        """Log selected-episode counts and per-task duration-weighted contributions."""
         tasks_count = len(self.tasks) if isinstance(self.tasks, list) else 0
         episodes_count = len(self.episodes) if isinstance(self.episodes, list) else 0
         selected_episodes = (

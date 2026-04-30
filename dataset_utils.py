@@ -96,6 +96,7 @@ def save_json_file(file_path, data):
 
 
 def episode_task_name(episode):
+    """Return the best available task label for an episode entry."""
     return (
         episode.get("task_name")
         or episode.get("task")
