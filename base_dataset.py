@@ -4,6 +4,7 @@ import random
 import re
 import time
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -206,7 +207,7 @@ class BaseDataset:
         self.logger.info(f"Saved selected metadata to {metadata_file.resolve()}")
         self._download_selected_episodes(selected_meta)
         return selected_meta
-    # TODO improve base_dataset folder structure 
+     
     def _download_selected_episodes(self, selected_meta: dict[str, Any]) -> None:
         """
         Download all files referenced by the selected manifest and store them
@@ -248,10 +249,12 @@ class BaseDataset:
                         file_path=remote_path,
                         use_hub_download=True,
                         token=self.token,
-                        local_dir=str(local_dir),
                         **self.kwargs,
                     )
-                    file_size = Path(downloaded_path).stat().st_size
+                    local_dir.mkdir(parents=True, exist_ok=True)
+                    destination_path = local_dir / Path(remote_path).name
+                    shutil.copy2(downloaded_path, destination_path)
+                    file_size = destination_path.stat().st_size
                     bytes_downloaded += file_size
                     found_files += 1
                     if has_size_estimate:
