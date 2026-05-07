@@ -21,19 +21,24 @@ class HFVJEPA2Encoder(torch.nn.Module):
         self.processor = AutoVideoProcessor.from_pretrained(hf_repo_id)
 
     def forward(self, video):
-        if video.ndim != 5:
-            raise ValueError(f"Expected 5D video tensor, got {tuple(video.shape)}")
-        # Final safety normalization to [B, C, T, H, W].
-        if video.shape[1] != 3:
-            if video.shape[2] == 3:
-                video = video.permute(0, 2, 1, 3, 4)
-            elif video.shape[-1] == 3:
-                video = video.permute(0, 4, 1, 2, 3)
-        if video.shape[1] != 3:
-            raise ValueError(f"Unable to normalize video to channel-first layout, got shape={tuple(video.shape)}")
-        video = video.contiguous()
-        outputs = self.model(pixel_values_videos=video)
-        return outputs.last_hidden_state
+      #print("[HFVJEPA2] raw input:", tuple(video.shape), flush=True)
+
+      if video.ndim != 5:
+          raise ValueError(f"Expected 5D video tensor, got {tuple(video.shape)}")
+
+      # behavior.py currently gives us [B, C, T, H, W].
+      # Hugging Face VJEPA2 expects [B, T, C, H, W].
+      if video.shape[1] == 3:
+          video = video.permute(0, 2, 1, 3, 4).contiguous()
+      elif video.shape[2] == 3:
+          video = video.contiguous()
+      else:
+          raise ValueError(f"Unable to infer channel axis, got {tuple(video.shape)}")
+
+      print("[HFVJEPA2] for HF:", tuple(video.shape), flush=True)
+
+      outputs = self.model(pixel_values_videos=video)
+      return outputs.last_hidden_state
 
 
 def main(cfg_path: str):
