@@ -37,7 +37,7 @@ class BaseDataset:
             token (str, optional): Hugging Face authentication token.
             **kwargs: Additional arguments for dataset loading.
         """
-        config = load_yaml_config("dataset.yaml")
+        config = load_yaml_config("base_dataset.yaml")
         self.dataset_cfg = config.get("dataset", {})
 
         # Explicitly set each attribute from config (no fallbacks)
