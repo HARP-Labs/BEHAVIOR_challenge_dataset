@@ -4,10 +4,24 @@ import argparse
 
 import torch
 import yaml
+from transformers import AutoModel, AutoVideoProcessor
 
 from vjepa2_BEHAVIOR.app.vjepa_droid.behavior import BehaviorEpisodePreencoder, BehaviorVideoDataset
 from vjepa2_BEHAVIOR.app.vjepa_droid.transforms import make_transforms
-from vjepa2_BEHAVIOR.app.vjepa_droid.utils import init_video_model, load_pretrained
+
+
+class HFVJEPA2Encoder(torch.nn.Module):
+    """Wrapper exposing HF V-JEPA2 encoder features as a plain tensor."""
+
+    def __init__(self, hf_repo_id: str):
+        super().__init__()
+        self.model = AutoModel.from_pretrained(hf_repo_id)
+        # Loaded for parity with official usage and future pre-processing hooks.
+        self.processor = AutoVideoProcessor.from_pretrained(hf_repo_id)
+
+    def forward(self, video):
+        outputs = self.model(pixel_values=video)
+        return outputs.last_hidden_state
 
 
 def main(cfg_path: str):
@@ -24,31 +38,8 @@ def main(cfg_path: str):
     dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    encoder, _ = init_video_model(
-        device=device,
-        patch_size=data_cfg["patch_size"],
-        max_num_frames=max(data_cfg["dataset_fpcs"]),
-        tubelet_size=data_cfg["tubelet_size"],
-        model_name=model_cfg["model_name"],
-        crop_size=data_cfg["crop_size"],
-        use_sdpa=meta_cfg.get("use_sdpa", False),
-        use_rope=model_cfg.get("use_rope", False),
-        use_silu=model_cfg.get("use_silu", False),
-        wide_silu=model_cfg.get("wide_silu", False),
-    )
-
-    ckpt = meta_cfg.get("pretrain_checkpoint")
-    if ckpt:
-        encoder, _, _ = load_pretrained(
-            ckpt,
-            encoder=encoder,
-            predictor=None,
-            target_encoder=None,
-            context_encoder_key=meta_cfg.get("context_encoder_key", "encoder"),
-            target_encoder_key=meta_cfg.get("target_encoder_key", "target_encoder"),
-            load_predictor=False,
-            load_encoder=True,
-        )
+    hf_repo_id = model_cfg.get("hf_repo", "facebook/vjepa2-vitg-fpc64-256")
+    encoder = HFVJEPA2Encoder(hf_repo_id=hf_repo_id).to(device)
 
     transform = make_transforms(
         random_horizontal_flip=aug_cfg.get("horizontal_flip", False),
