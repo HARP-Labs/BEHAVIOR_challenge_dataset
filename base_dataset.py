@@ -46,16 +46,7 @@ class BaseDataset:
         self.seed = self.dataset_cfg["seed"]
         self.eval_tasks = self.dataset_cfg["eval_tasks"]
         self.exclude_eval_tasks = self.dataset_cfg["exclude_eval_tasks"]
-        self.obs_resolution = self.dataset_cfg["obs_resolution"]
-        self.fps = self.dataset_cfg["fps"]
-        self.shard_size = self.dataset_cfg["shard_size"]
         self.base_dataset_destination = self.dataset_cfg["base_dataset_destination"]
-        self.encoded_dataset_destination = self.dataset_cfg["encoded_dataset_destination"]
-        self.encoded_dataset_destination_path = self.dataset_cfg[
-            "encoded_dataset_destination_path"
-        ]
-        self.augmentation = self.dataset_cfg["augmentation"]
-        self.encode_dataset = self.dataset_cfg["encode_dataset"]
 
         self.repo_id = "behavior-1k/2025-challenge-demos"
         self.use_hub_download = use_hub_download
@@ -69,12 +60,7 @@ class BaseDataset:
             "seed": self.seed,
             "eval_tasks": len(self.eval_tasks),
             "exclude_eval_tasks": self.exclude_eval_tasks,
-            "obs_resolution": self.obs_resolution,
-            "fps": self.fps,
-            "shard_size": self.shard_size,
             "base_dst": self.base_dataset_destination,
-            "encoded_dst": self.encoded_dataset_destination,
-            "encode_dataset": self.encode_dataset,
         }
         self.logger.info(f"BaseDataset config: {config_preview}")
 
