@@ -277,8 +277,18 @@ class BehaviorEpisodePreencoder:
             video = video.unsqueeze(0)
         if video.ndim != 5:
             raise ValueError(f"Expected 5D video tensor, got shape={tuple(video.shape)}")
-        if video.shape[-1] in (1, 3):
+        # Normalize to [B, C, T, H, W] for 3D patch embedding.
+        if video.shape[1] in (1, 3):
+            # Already [B, C, T, H, W]
+            pass
+        elif video.shape[2] in (1, 3):
+            # [B, T, C, H, W] -> [B, C, T, H, W]
+            video = video.permute(0, 2, 1, 3, 4)
+        elif video.shape[-1] in (1, 3):
+            # [B, T, H, W, C] -> [B, C, T, H, W]
             video = video.permute(0, 4, 1, 2, 3)
+        else:
+            raise ValueError(f"Unable to infer channel axis for video shape={tuple(video.shape)}")
         return video.to(self.device, dtype=self.dtype, non_blocking=True)
 
     @staticmethod
