@@ -12,7 +12,7 @@ from huggingface_hub import HfApi
 from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 from tqdm import tqdm
 
-from .dataset_utils import (
+from .base_dataset_utils import (
     episode_duration_minutes,
     episode_task_name,
     load_from_huggingface,
