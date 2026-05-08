@@ -72,6 +72,8 @@ def main(cfg_path: str):
         state_start_idx=data_cfg.get("state_start_idx", 0),
         state_dim=data_cfg.get("state_dim", 7),
         action_dim=data_cfg.get("action_dim", 23),
+        cache_parquet=data_cfg.get("cache_parquet", False),
+        cache_video_readers=data_cfg.get("cache_video_readers", False),
     )
 
     preencoder = BehaviorEpisodePreencoder(encoder=encoder, device=device, dtype=dtype)
