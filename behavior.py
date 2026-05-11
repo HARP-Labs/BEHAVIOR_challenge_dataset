@@ -377,6 +377,9 @@ class BehaviorEpisodePreencoder:
             if isinstance(tokens, (tuple, list)):
                 tokens = tokens[0]
             tokens = tokens.detach().cpu().float().numpy()
+            # Reshape [B, N, D] -> [B, fpc, patches_per_frame, D] so axis 1 aligns with frames.
+            tokens_per_frame = tokens.shape[1] // dataset.fpc
+            tokens = tokens.reshape(tokens.shape[0], dataset.fpc, tokens_per_frame, tokens.shape[2])
             for b in range(tokens.shape[0]):
                 episode_idx = int(batch["episode_idx"][b])
                 valid_len = int(batch["valid_len"][b])
@@ -388,8 +391,7 @@ class BehaviorEpisodePreencoder:
                     active_episode_idx = episode_idx
                     active_buffer = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
 
-                tokens_per_frame = tokens.shape[1] // dataset.fpc
-                active_buffer["tokens"].append(tokens[b, :valid_len * tokens_per_frame])
+                active_buffer["tokens"].append(tokens[b, :valid_len])
                 active_buffer["actions"].append(batch["actions"][b, :valid_len])
                 active_buffer["states"].append(batch["states"][b, :valid_len])
                 active_buffer["frame_indices"].append(batch["frame_indices"][b, :valid_len])
