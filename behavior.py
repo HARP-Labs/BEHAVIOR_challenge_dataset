@@ -329,7 +329,7 @@ class BehaviorEpisodePreencoder:
             return "gpu=n/a"
 
     @torch.inference_mode()
-    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", episodes_per_shard=1, batch_size=8, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2):
+    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=8, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2):
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
         if not output_dir and not hf_repo_id:
@@ -345,27 +345,32 @@ class BehaviorEpisodePreencoder:
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             collate_fn=self.behavior_preencode_collate,
         )
-        shard_data, shard_id, encoded_episodes = [], 0, 0
+        shard_data, shard_id, shard_bytes, encoded_episodes = [], 0, 0, 0
         active_episode_idx = None
         active_buffer = None
 
         def flush_active_episode():
-            nonlocal shard_data, shard_id, encoded_episodes, active_episode_idx, active_buffer
+            nonlocal shard_data, shard_id, shard_bytes, encoded_episodes, active_episode_idx, active_buffer
             if active_episode_idx is None or active_buffer is None or not active_buffer["tokens"]:
                 return
             order = np.argsort(active_buffer["starts"])
+            tokens       = np.concatenate([active_buffer["tokens"][i]       for i in order], axis=0)
+            actions      = np.concatenate([active_buffer["actions"][i]      for i in order], axis=0)
+            states       = np.concatenate([active_buffer["states"][i]       for i in order], axis=0)
+            frame_indices= np.concatenate([active_buffer["frame_indices"][i] for i in order], axis=0)
             shard_data.append({
-                "episode_idx": int(active_episode_idx),
-                "sample_idx": int(dataset.episode_plans[active_episode_idx]["sample_idx"]),
-                "tokens": np.concatenate([active_buffer["tokens"][i] for i in order], axis=0),
-                "actions": np.concatenate([active_buffer["actions"][i] for i in order], axis=0),
-                "states": np.concatenate([active_buffer["states"][i] for i in order], axis=0),
-                "frame_indices": np.concatenate([active_buffer["frame_indices"][i] for i in order], axis=0),
+                "episode_idx":   int(active_episode_idx),
+                "sample_idx":    int(dataset.episode_plans[active_episode_idx]["sample_idx"]),
+                "tokens":        tokens,
+                "actions":       actions,
+                "states":        states,
+                "frame_indices": frame_indices,
             })
+            shard_bytes += tokens.nbytes + actions.nbytes + states.nbytes + frame_indices.nbytes
             encoded_episodes += 1
-            if len(shard_data) >= episodes_per_shard:
+            if shard_bytes >= max_shard_bytes:
                 self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=shard_id, shard_data=shard_data)
-                shard_data, shard_id = [], shard_id + 1
+                shard_data, shard_id, shard_bytes = [], shard_id + 1, 0
             active_episode_idx = None
             active_buffer = None
 
@@ -402,18 +407,58 @@ class BehaviorEpisodePreencoder:
         if shard_data:
             self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=shard_id, shard_data=shard_data)
 
-        logger.info(f"Pre-encoding finished: {encoded_episodes} episodes encoded")
+        logger.info(f"Pre-encoding finished: {encoded_episodes} episodes encoded into {shard_id + 1} shards")
 
     def _write_shard(self, shard_id, shard_data, output_dir=None, hf_repo_id=None, hf_path_prefix="", hf_repo_type="dataset"):
         shard_name = f"behavior_preencoded_shard_{shard_id:05d}.pt"
+
+        # Build frame-boundary index and concatenate all episodes into flat arrays.
+        episode_index = []
+        cursor = 0
+        for ep in shard_data:
+            n = ep["tokens"].shape[0]
+            episode_index.append({
+                "episode_idx":   ep["episode_idx"],
+                "sample_idx":    ep["sample_idx"],
+                "frame_start":   cursor,
+                "frame_end":     cursor + n,
+            })
+            cursor += n
+
+        shard = {
+            "tokens":        np.concatenate([ep["tokens"]        for ep in shard_data], axis=0),
+            "actions":       np.concatenate([ep["actions"]       for ep in shard_data], axis=0),
+            "states":        np.concatenate([ep["states"]        for ep in shard_data], axis=0),
+            "frame_indices": np.concatenate([ep["frame_indices"] for ep in shard_data], axis=0),
+            "episodes":      episode_index,
+        }
+
         if output_dir:
             save_path = os.path.join(output_dir, shard_name)
-            torch.save(shard_data, save_path)
-            logger.info(f"Saved shard {shard_id} with {len(shard_data)} items at {save_path}")
+            torch.save(shard, save_path)
+            size_mb = os.path.getsize(save_path) / 1e6
+            logger.info(f"Saved shard {shard_id} with {len(episode_index)} episodes ({size_mb:.1f} MB) at {save_path}")
+            self._update_shard_index(output_dir, shard_name, episode_index, shard["tokens"].nbytes + shard["actions"].nbytes + shard["states"].nbytes)
         if hf_repo_id:
             bio = io.BytesIO()
-            torch.save(shard_data, bio)
+            torch.save(shard, bio)
             bio.seek(0)
             path_in_repo = f"{hf_path_prefix.strip('/')}/{shard_name}".lstrip("/")
             HfApi().upload_file(path_or_fileobj=bio, path_in_repo=path_in_repo, repo_id=hf_repo_id, repo_type=hf_repo_type)
-            logger.info(f"Uploaded shard {shard_id} with {len(shard_data)} items to hf://{hf_repo_id}/{path_in_repo}")
+            logger.info(f"Uploaded shard {shard_id} with {len(episode_index)} episodes to hf://{hf_repo_id}/{path_in_repo}")
+
+    @staticmethod
+    def _update_shard_index(output_dir, shard_name, episode_index, size_bytes):
+        index_path = os.path.join(output_dir, "shard_index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                index = json.load(f)
+        else:
+            index = {"shards": []}
+        index["shards"].append({
+            "file":       shard_name,
+            "size_bytes": size_bytes,
+            "episodes":   episode_index,
+        })
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2)
