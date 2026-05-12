@@ -1,3 +1,4 @@
+import concurrent.futures
 import io
 import json
 import os
@@ -342,49 +343,54 @@ class BehaviorEpisodePreencoder:
             "shard_data": [], "shard_id": 0, "shard_bytes": 0,
             "encoded_episodes": 0, "total_shards_written": 0,
             "active_episode_idx": None, "active_buffer": None,
+            "pending_write": None,
         }
 
-        pbar = tqdm(data_loader, desc="Loading batches")
-        for batch_idx, batch in enumerate(pbar):
-            if batch_idx % 10 == 0:
-                pbar.set_postfix_str(self._gpu_status())
-            tokens = self.encoder(self._to_video_tensor(batch["video"]))
-            if isinstance(tokens, (tuple, list)):
-                tokens = tokens[0]
-            storage_dtype = torch.float16 if self.dtype == torch.bfloat16 else self.dtype
-            tokens = tokens.detach().cpu().to(storage_dtype).numpy()
-            # Reshape [B, N, D] -> [B, fpc, patches_per_frame, D] so axis 1 aligns with frames.
-            assert tokens.shape[1] % dataset.fpc == 0, (
-                f"Encoder output tokens ({tokens.shape[1]}) not divisible by fpc ({dataset.fpc})"
-            )
-            tokens_per_frame = tokens.shape[1] // dataset.fpc
-            tokens = tokens.reshape(tokens.shape[0], dataset.fpc, tokens_per_frame, tokens.shape[2])
-            for b in range(tokens.shape[0]):
-                episode_idx = int(batch["episode_idx"][b])
-                valid_len = int(batch["valid_len"][b])
-                if state["active_episode_idx"] is None:
-                    state["active_episode_idx"] = episode_idx
-                    state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
-                elif episode_idx != state["active_episode_idx"]:
-                    self._flush_active_episode(state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes)
-                    state["active_episode_idx"] = episode_idx
-                    state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as write_executor:
+            pbar = tqdm(data_loader, desc="Loading batches")
+            for batch_idx, batch in enumerate(pbar):
+                if batch_idx % 10 == 0:
+                    pbar.set_postfix_str(self._gpu_status())
+                tokens = self.encoder(self._to_video_tensor(batch["video"]))
+                if isinstance(tokens, (tuple, list)):
+                    tokens = tokens[0]
+                storage_dtype = torch.float16 if self.dtype == torch.bfloat16 else self.dtype
+                tokens = tokens.detach().cpu().to(storage_dtype).numpy()
+                # Reshape [B, N, D] -> [B, fpc, patches_per_frame, D] so axis 1 aligns with frames.
+                assert tokens.shape[1] % dataset.fpc == 0, (
+                    f"Encoder output tokens ({tokens.shape[1]}) not divisible by fpc ({dataset.fpc})"
+                )
+                tokens_per_frame = tokens.shape[1] // dataset.fpc
+                tokens = tokens.reshape(tokens.shape[0], dataset.fpc, tokens_per_frame, tokens.shape[2])
+                for b in range(tokens.shape[0]):
+                    episode_idx = int(batch["episode_idx"][b])
+                    valid_len = int(batch["valid_len"][b])
+                    if state["active_episode_idx"] is None:
+                        state["active_episode_idx"] = episode_idx
+                        state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
+                    elif episode_idx != state["active_episode_idx"]:
+                        self._flush_active_episode(state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes, write_executor)
+                        state["active_episode_idx"] = episode_idx
+                        state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
 
-                state["active_buffer"]["tokens"].append(tokens[b, :valid_len])
-                state["active_buffer"]["actions"].append(batch["actions"][b, :valid_len])
-                state["active_buffer"]["states"].append(batch["states"][b, :valid_len])
-                state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_len])
-                state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
+                    state["active_buffer"]["tokens"].append(tokens[b, :valid_len])
+                    state["active_buffer"]["actions"].append(batch["actions"][b, :valid_len])
+                    state["active_buffer"]["states"].append(batch["states"][b, :valid_len])
+                    state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_len])
+                    state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
 
-        self._flush_active_episode(state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes)
+            self._flush_active_episode(state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes, write_executor)
 
-        if state["shard_data"]:
-            self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=state["shard_id"], shard_data=state["shard_data"])
-            state["total_shards_written"] += 1
+            if state["pending_write"] is not None:
+                state["pending_write"].result()
+
+            if state["shard_data"]:
+                self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=state["shard_id"], shard_data=state["shard_data"])
+                state["total_shards_written"] += 1
 
         logger.info(f"Pre-encoding finished: {state['encoded_episodes']} episodes encoded into {state['total_shards_written']} shards")
 
-    def _flush_active_episode(self, state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes):
+    def _flush_active_episode(self, state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes, write_executor):
         if state["active_episode_idx"] is None or state["active_buffer"] is None or not state["active_buffer"]["tokens"]:
             return
         buf = state["active_buffer"]
@@ -404,7 +410,13 @@ class BehaviorEpisodePreencoder:
         state["shard_bytes"] += tokens.nbytes + actions.nbytes + states.nbytes + frame_indices.nbytes
         state["encoded_episodes"] += 1
         if state["shard_bytes"] >= max_shard_bytes:
-            self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=state["shard_id"], shard_data=state["shard_data"])
+            if state["pending_write"] is not None:
+                state["pending_write"].result()
+            state["pending_write"] = write_executor.submit(
+                self._write_shard,
+                output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix,
+                shard_id=state["shard_id"], shard_data=state["shard_data"],
+            )
             state["total_shards_written"] += 1
             state["shard_data"] = []
             state["shard_id"] += 1
