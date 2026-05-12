@@ -338,35 +338,11 @@ class BehaviorEpisodePreencoder:
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             collate_fn=self.behavior_preencode_collate,
         )
-        shard_data, shard_id, shard_bytes, encoded_episodes, total_shards_written = [], 0, 0, 0, 0
-        active_episode_idx = None
-        active_buffer = None
-
-        def flush_active_episode():
-            nonlocal shard_data, shard_id, shard_bytes, encoded_episodes, active_episode_idx, active_buffer, total_shards_written
-            if active_episode_idx is None or active_buffer is None or not active_buffer["tokens"]:
-                return
-            order = np.argsort(active_buffer["starts"])
-            tokens       = np.concatenate([active_buffer["tokens"][i]       for i in order], axis=0)
-            actions      = np.concatenate([active_buffer["actions"][i]      for i in order], axis=0)
-            states       = np.concatenate([active_buffer["states"][i]       for i in order], axis=0)
-            frame_indices= np.concatenate([active_buffer["frame_indices"][i] for i in order], axis=0)
-            shard_data.append({
-                "episode_idx":   int(active_episode_idx),
-                "sample_idx":    int(dataset.episode_plans[active_episode_idx]["sample_idx"]),
-                "tokens":        tokens,
-                "actions":       actions,
-                "states":        states,
-                "frame_indices": frame_indices,
-            })
-            shard_bytes += tokens.nbytes + actions.nbytes + states.nbytes + frame_indices.nbytes
-            encoded_episodes += 1
-            if shard_bytes >= max_shard_bytes:
-                self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=shard_id, shard_data=shard_data)
-                total_shards_written += 1
-                shard_data, shard_id, shard_bytes = [], shard_id + 1, 0
-            active_episode_idx = None
-            active_buffer = None
+        state = {
+            "shard_data": [], "shard_id": 0, "shard_bytes": 0,
+            "encoded_episodes": 0, "total_shards_written": 0,
+            "active_episode_idx": None, "active_buffer": None,
+        }
 
         pbar = tqdm(data_loader, desc="Loading batches")
         for batch_idx, batch in enumerate(pbar):
@@ -386,27 +362,55 @@ class BehaviorEpisodePreencoder:
             for b in range(tokens.shape[0]):
                 episode_idx = int(batch["episode_idx"][b])
                 valid_len = int(batch["valid_len"][b])
-                if active_episode_idx is None:
-                    active_episode_idx = episode_idx
-                    active_buffer = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
-                elif episode_idx != active_episode_idx:
-                    flush_active_episode()
-                    active_episode_idx = episode_idx
-                    active_buffer = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
+                if state["active_episode_idx"] is None:
+                    state["active_episode_idx"] = episode_idx
+                    state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
+                elif episode_idx != state["active_episode_idx"]:
+                    self._flush_active_episode(state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes)
+                    state["active_episode_idx"] = episode_idx
+                    state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
 
-                active_buffer["tokens"].append(tokens[b, :valid_len])
-                active_buffer["actions"].append(batch["actions"][b, :valid_len])
-                active_buffer["states"].append(batch["states"][b, :valid_len])
-                active_buffer["frame_indices"].append(batch["frame_indices"][b, :valid_len])
-                active_buffer["starts"].append(int(batch["start_idx"][b]))
+                state["active_buffer"]["tokens"].append(tokens[b, :valid_len])
+                state["active_buffer"]["actions"].append(batch["actions"][b, :valid_len])
+                state["active_buffer"]["states"].append(batch["states"][b, :valid_len])
+                state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_len])
+                state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
 
-        flush_active_episode()
+        self._flush_active_episode(state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes)
 
-        if shard_data:
-            self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=shard_id, shard_data=shard_data)
-            total_shards_written += 1
+        if state["shard_data"]:
+            self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=state["shard_id"], shard_data=state["shard_data"])
+            state["total_shards_written"] += 1
 
-        logger.info(f"Pre-encoding finished: {encoded_episodes} episodes encoded into {total_shards_written} shards")
+        logger.info(f"Pre-encoding finished: {state['encoded_episodes']} episodes encoded into {state['total_shards_written']} shards")
+
+    def _flush_active_episode(self, state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes):
+        if state["active_episode_idx"] is None or state["active_buffer"] is None or not state["active_buffer"]["tokens"]:
+            return
+        buf = state["active_buffer"]
+        order = np.argsort(buf["starts"])
+        tokens        = np.concatenate([buf["tokens"][i]        for i in order], axis=0)
+        actions       = np.concatenate([buf["actions"][i]       for i in order], axis=0)
+        states        = np.concatenate([buf["states"][i]        for i in order], axis=0)
+        frame_indices = np.concatenate([buf["frame_indices"][i] for i in order], axis=0)
+        state["shard_data"].append({
+            "episode_idx":   int(state["active_episode_idx"]),
+            "sample_idx":    int(dataset.episode_plans[state["active_episode_idx"]]["sample_idx"]),
+            "tokens":        tokens,
+            "actions":       actions,
+            "states":        states,
+            "frame_indices": frame_indices,
+        })
+        state["shard_bytes"] += tokens.nbytes + actions.nbytes + states.nbytes + frame_indices.nbytes
+        state["encoded_episodes"] += 1
+        if state["shard_bytes"] >= max_shard_bytes:
+            self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=state["shard_id"], shard_data=state["shard_data"])
+            state["total_shards_written"] += 1
+            state["shard_data"] = []
+            state["shard_id"] += 1
+            state["shard_bytes"] = 0
+        state["active_episode_idx"] = None
+        state["active_buffer"] = None
 
     def _write_shard(self, shard_id, shard_data, output_dir=None, hf_repo_id=None, hf_path_prefix="", hf_repo_type="dataset"):
         shard_name = f"behavior_preencoded_shard_{shard_id:05d}.pt"
