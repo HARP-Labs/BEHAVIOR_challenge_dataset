@@ -1,5 +1,4 @@
 import concurrent.futures
-import io
 import json
 import os
 import subprocess
@@ -455,19 +454,30 @@ class BehaviorEpisodePreencoder:
             logger.info(f"Saved shard {shard_id} with {len(episode_index)} episodes ({size_mb:.1f} MB) at {save_path}")
             self._update_shard_index(output_dir, shard_name, episode_index, shard["tokens"].nbytes + shard["actions"].nbytes + shard["states"].nbytes + shard["frame_indices"].nbytes)
         if hf_repo_id:
-            bio = io.BytesIO()
-            torch.save(shard, bio)
-            bio.seek(0)
             path_in_repo = f"{hf_path_prefix.strip('/')}/{shard_name}".lstrip("/")
-            for attempt in range(3):
-                try:
-                    HfApi().upload_file(path_or_fileobj=bio, path_in_repo=path_in_repo, repo_id=hf_repo_id, repo_type=hf_repo_type)
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        raise
-                    logger.warning(f"HF upload attempt {attempt+1}/3 failed: {e}. Retrying...")
-                    bio.seek(0)
+            # Upload from a real file path so Xet Storage can use chunked upload.
+            # If we already saved locally, reuse that file; otherwise write a temp file.
+            if output_dir:
+                upload_path = save_path
+                tmp_file = None
+            else:
+                import tempfile
+                tmp_file = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+                torch.save(shard, tmp_file.name)
+                tmp_file.close()
+                upload_path = tmp_file.name
+            try:
+                for attempt in range(3):
+                    try:
+                        HfApi().upload_file(path_or_fileobj=upload_path, path_in_repo=path_in_repo, repo_id=hf_repo_id, repo_type=hf_repo_type)
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            raise
+                        logger.warning(f"HF upload attempt {attempt+1}/3 failed: {e}. Retrying...")
+            finally:
+                if tmp_file is not None:
+                    os.remove(upload_path)
             logger.info(f"Uploaded shard {shard_id} with {len(episode_index)} episodes to hf://{hf_repo_id}/{path_in_repo}")
 
     @staticmethod
