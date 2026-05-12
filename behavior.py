@@ -375,7 +375,8 @@ class BehaviorEpisodePreencoder:
             tokens = self.encoder(self._to_video_tensor(batch["video"]))
             if isinstance(tokens, (tuple, list)):
                 tokens = tokens[0]
-            tokens = tokens.detach().cpu().float().numpy()
+            storage_dtype = torch.float16 if self.dtype == torch.bfloat16 else self.dtype
+            tokens = tokens.detach().cpu().to(storage_dtype).numpy()
             # Reshape [B, N, D] -> [B, fpc, patches_per_frame, D] so axis 1 aligns with frames.
             assert tokens.shape[1] % dataset.fpc == 0, (
                 f"Encoder output tokens ({tokens.shape[1]}) not divisible by fpc ({dataset.fpc})"

@@ -76,7 +76,7 @@ def main(cfg_path: str):
         output_dir=out_cfg.get("local_output_dir"),
         hf_repo_id=out_cfg.get("hf_repo_id"),
         hf_path_prefix=out_cfg.get("hf_path_prefix", ""),
-        episodes_per_shard=out_cfg.get("episodes_per_shard", 1),
+        max_shard_bytes=out_cfg.get("max_shard_bytes", 1 << 30),
         batch_size=data_cfg.get("batch_size", 8),
         num_workers=num_workers,
         pin_memory=data_cfg.get("pin_mem", True),
