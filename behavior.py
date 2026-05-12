@@ -206,27 +206,17 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         for i, start in enumerate(window_indices):
             start = int(start)
             if start >= max_len:
-                state_chunk = np.zeros((fstp, self.state_dim), dtype=np.float32)
-                action_chunk = np.zeros((fstp, self.action_dim), dtype=np.float32)
-                states.append(state_chunk.reshape(fstp * self.state_dim))
-                actions.append(action_chunk.reshape(fstp * self.action_dim))
+                states.append(np.zeros(self.state_dim, dtype=np.float32))
+                actions.append(np.zeros(fstp * self.action_dim, dtype=np.float32))
                 continue
             if i + 1 < len(real_window_indices):
                 next_start = int(real_window_indices[i + 1])
             else:
                 next_start = start + fstp
             end = min(max(next_start, start + 1), max_len)
-            state_chunk = raw_states[start:end]
             action_chunk = raw_actions[start:end]
 
-            if len(state_chunk) == 0:
-                logger.warning(f"Empty state chunk for {vpath=}, {start=}, {end=}")
-                state_chunk = np.zeros((fstp, self.state_dim), dtype=np.float32)
-            elif len(state_chunk) < fstp:
-                pad = np.repeat(state_chunk[-1:], fstp - len(state_chunk), axis=0)
-                state_chunk = np.concatenate([state_chunk, pad], axis=0)
-            else:
-                state_chunk = state_chunk[:fstp]
+            states.append(raw_states[start])
 
             if len(action_chunk) == 0:
                 logger.warning(f"Empty action chunk for {vpath=}, {start=}, {end=}")
@@ -237,7 +227,6 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             else:
                 action_chunk = action_chunk[:fstp]
 
-            states.append(state_chunk.reshape(fstp * self.state_dim))
             actions.append(action_chunk.reshape(fstp * self.action_dim))
 
         states = np.asarray(states, dtype=np.float32)
