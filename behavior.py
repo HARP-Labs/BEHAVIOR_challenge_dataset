@@ -1,13 +1,13 @@
-import concurrent.futures
-import io
 import json
 import os
+import shutil
 import subprocess
-import tarfile
+import tempfile
 from logging import getLogger
 from math import ceil
 from tqdm import tqdm
 import numpy as np
+from streaming import MDSWriter
 import pandas as pd
 import torch
 import torch.utils.data
@@ -323,12 +323,29 @@ class BehaviorEpisodePreencoder:
         except Exception:
             return "gpu=n/a"
 
+    _MDS_COLUMNS = {
+        "tokens":      "ndarray",
+        "actions":     "ndarray",
+        "states":      "ndarray",
+        "frame_index": "int",
+        "episode_idx": "int",
+        "sample_idx":  "int",
+        "frame_pos":   "int",
+        "episode_len": "int",
+    }
+
     @torch.inference_mode()
     def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=8, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2):
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
         if not output_dir and not hf_repo_id:
             raise ValueError("Either output_dir or hf_repo_id must be provided")
+
+        tmp_dir = None
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            write_dir = output_dir
+        else:
+            tmp_dir = tempfile.mkdtemp()
+            write_dir = tmp_dir
 
         data_loader = torch.utils.data.DataLoader(
             dataset,
@@ -341,158 +358,92 @@ class BehaviorEpisodePreencoder:
             collate_fn=self.behavior_preencode_collate,
         )
         state = {
-            "shard_data": [], "shard_id": 0, "shard_bytes": 0,
-            "encoded_episodes": 0, "total_shards_written": 0,
-            "active_episode_idx": None, "active_buffer": None,
-            "pending_write": None,
+            "encoded_episodes": 0,
+            "encoded_frames": 0,
+            "active_episode_idx": None,
+            "active_buffer": None,
         }
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as write_executor:
-            pbar = tqdm(data_loader, desc="Loading batches")
-            for batch_idx, batch in enumerate(pbar):
-                if batch_idx % 10 == 0:
-                    pbar.set_postfix_str(self._gpu_status())
-                tokens = self.encoder(self._to_video_tensor(batch["video"]))
-                if isinstance(tokens, (tuple, list)):
-                    tokens = tokens[0]
-                storage_dtype = torch.float16 if self.dtype == torch.bfloat16 else self.dtype
-                tokens = tokens.detach().cpu().to(storage_dtype).numpy()
-                # Reshape [B, N, D] -> [B, fpc, patches_per_frame, D] so axis 1 aligns with frames.
-                assert tokens.shape[1] % dataset.fpc == 0, (
-                    f"Encoder output tokens ({tokens.shape[1]}) not divisible by fpc ({dataset.fpc})"
-                )
-                tokens_per_frame = tokens.shape[1] // dataset.fpc
-                tokens = tokens.reshape(tokens.shape[0], dataset.fpc, tokens_per_frame, tokens.shape[2])
-                for b in range(tokens.shape[0]):
-                    episode_idx = int(batch["episode_idx"][b])
-                    valid_len = int(batch["valid_len"][b])
-                    if state["active_episode_idx"] is None:
-                        state["active_episode_idx"] = episode_idx
-                        state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
-                    elif episode_idx != state["active_episode_idx"]:
-                        self._flush_active_episode(state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes, write_executor)
-                        state["active_episode_idx"] = episode_idx
-                        state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
+        try:
+            with MDSWriter(out=write_dir, columns=self._MDS_COLUMNS, size_limit=max_shard_bytes) as writer:
+                pbar = tqdm(data_loader, desc="Encoding batches")
+                for batch_idx, batch in enumerate(pbar):
+                    if batch_idx % 10 == 0:
+                        pbar.set_postfix_str(self._gpu_status())
+                    tokens = self.encoder(self._to_video_tensor(batch["video"]))
+                    if isinstance(tokens, (tuple, list)):
+                        tokens = tokens[0]
+                    storage_dtype = torch.float16 if self.dtype == torch.bfloat16 else self.dtype
+                    tokens = tokens.detach().cpu().to(storage_dtype).numpy()
+                    # Reshape [B, N, D] -> [B, fpc, patches_per_frame, D] so axis 1 aligns with frames.
+                    assert tokens.shape[1] % dataset.fpc == 0, (
+                        f"Encoder output tokens ({tokens.shape[1]}) not divisible by fpc ({dataset.fpc})"
+                    )
+                    tokens_per_frame = tokens.shape[1] // dataset.fpc
+                    tokens = tokens.reshape(tokens.shape[0], dataset.fpc, tokens_per_frame, tokens.shape[2])
+                    for b in range(tokens.shape[0]):
+                        episode_idx = int(batch["episode_idx"][b])
+                        valid_len = int(batch["valid_len"][b])
+                        if state["active_episode_idx"] is None:
+                            state["active_episode_idx"] = episode_idx
+                            state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
+                        elif episode_idx != state["active_episode_idx"]:
+                            self._flush_active_episode(state, dataset, writer)
+                            state["active_episode_idx"] = episode_idx
+                            state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
+                        state["active_buffer"]["tokens"].append(tokens[b, :valid_len])
+                        state["active_buffer"]["actions"].append(batch["actions"][b, :valid_len])
+                        state["active_buffer"]["states"].append(batch["states"][b, :valid_len])
+                        state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_len])
+                        state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
+                self._flush_active_episode(state, dataset, writer)
 
-                    state["active_buffer"]["tokens"].append(tokens[b, :valid_len])
-                    state["active_buffer"]["actions"].append(batch["actions"][b, :valid_len])
-                    state["active_buffer"]["states"].append(batch["states"][b, :valid_len])
-                    state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_len])
-                    state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
+            logger.info(f"Pre-encoding finished: {state['encoded_episodes']} episodes, {state['encoded_frames']} frames written")
 
-            self._flush_active_episode(state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes, write_executor)
-
-            if state["pending_write"] is not None:
-                state["pending_write"].result()
-
-            if state["shard_data"]:
-                self._write_shard(output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix, shard_id=state["shard_id"], shard_data=state["shard_data"])
-                state["total_shards_written"] += 1
-
-        if output_dir and hf_repo_id:
-            index_path = os.path.join(output_dir, "shard_index.json")
-            if os.path.exists(index_path):
-                index_in_repo = f"{hf_path_prefix.strip('/')}/shard_index.json".lstrip("/")
-                HfApi().upload_file(path_or_fileobj=index_path, path_in_repo=index_in_repo, repo_id=hf_repo_id, repo_type="dataset")
-                logger.info(f"Uploaded shard_index.json to hf://{hf_repo_id}/{index_in_repo}")
-
-        logger.info(f"Pre-encoding finished: {state['encoded_episodes']} episodes encoded into {state['total_shards_written']} shards")
-
-    def _flush_active_episode(self, state, dataset, output_dir, hf_repo_id, hf_path_prefix, max_shard_bytes, write_executor):
-        if state["active_episode_idx"] is None or state["active_buffer"] is None or not state["active_buffer"]["tokens"]:
-            return
-        buf = state["active_buffer"]
-        order = np.argsort(buf["starts"])
-        tokens        = np.concatenate([buf["tokens"][i]        for i in order], axis=0)
-        actions       = np.concatenate([buf["actions"][i]       for i in order], axis=0)
-        states        = np.concatenate([buf["states"][i]        for i in order], axis=0)
-        frame_indices = np.concatenate([buf["frame_indices"][i] for i in order], axis=0)
-        state["shard_data"].append({
-            "episode_idx":   int(state["active_episode_idx"]),
-            "sample_idx":    int(dataset.episode_plans[state["active_episode_idx"]]["sample_idx"]),
-            "tokens":        tokens,
-            "actions":       actions,
-            "states":        states,
-            "frame_indices": frame_indices,
-        })
-        state["shard_bytes"] += tokens.nbytes + actions.nbytes + states.nbytes + frame_indices.nbytes
-        state["encoded_episodes"] += 1
-        if state["shard_bytes"] >= max_shard_bytes:
-            if state["pending_write"] is not None:
-                state["pending_write"].result()
-            state["pending_write"] = write_executor.submit(
-                self._write_shard,
-                output_dir=output_dir, hf_repo_id=hf_repo_id, hf_path_prefix=hf_path_prefix,
-                shard_id=state["shard_id"], shard_data=state["shard_data"],
-            )
-            state["total_shards_written"] += 1
-            state["shard_data"] = []
-            state["shard_id"] += 1
-            state["shard_bytes"] = 0
-        state["active_episode_idx"] = None
-        state["active_buffer"] = None
-
-    def _write_shard(self, shard_id, shard_data, output_dir=None, hf_repo_id=None, hf_path_prefix="", hf_repo_type="dataset"):
-        shard_name = f"behavior_preencoded_shard_{shard_id:05d}.tar"
-
-        def _save_tar(path):
-            """Write each episode as a WebDataset sample inside a tar shard."""
-            with tarfile.open(path, "w") as tf:
-                for ep in shard_data:
-                    key = f"{ep['episode_idx']:06d}"
-                    for field in ("tokens", "actions", "states", "frame_indices"):
-                        buf = io.BytesIO()
-                        np.save(buf, ep[field])
-                        data = buf.getvalue()
-                        info = tarfile.TarInfo(name=f"{key}.{field}.npy")
-                        info.size = len(data)
-                        tf.addfile(info, io.BytesIO(data))
-                    meta = json.dumps({"episode_idx": ep["episode_idx"], "sample_idx": ep["sample_idx"]}).encode()
-                    info = tarfile.TarInfo(name=f"{key}.json")
-                    info.size = len(meta)
-                    tf.addfile(info, io.BytesIO(meta))
-
-        episode_index = [{"episode_idx": ep["episode_idx"], "sample_idx": ep["sample_idx"]} for ep in shard_data]
-        size_bytes = sum(ep["tokens"].nbytes + ep["actions"].nbytes + ep["states"].nbytes + ep["frame_indices"].nbytes for ep in shard_data)
-
-        if output_dir:
-            save_path = os.path.join(output_dir, shard_name)
-            _save_tar(save_path)
-            self._update_shard_index(output_dir, shard_name, episode_index, size_bytes)
-        if hf_repo_id:
-            path_in_repo = f"{hf_path_prefix.strip('/')}/{shard_name}".lstrip("/")
-            if output_dir:
-                upload_path = save_path
-            else:
-                import tempfile
-                tmp_file = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
-                tmp_file.close()
-                _save_tar(tmp_file.name)
-                upload_path = tmp_file.name
-            try:
+            if hf_repo_id:
+                path_in_repo = hf_path_prefix.strip("/") or None
                 for attempt in range(3):
                     try:
-                        HfApi().upload_file(path_or_fileobj=upload_path, path_in_repo=path_in_repo, repo_id=hf_repo_id, repo_type=hf_repo_type)
+                        HfApi().upload_folder(
+                            folder_path=write_dir,
+                            repo_id=hf_repo_id,
+                            repo_type="dataset",
+                            path_in_repo=path_in_repo,
+                        )
+                        logger.info(f"Uploaded MDS shards to hf://{hf_repo_id}/{path_in_repo or ''}")
                         break
                     except Exception as e:
                         if attempt == 2:
                             raise
                         logger.warning(f"HF upload attempt {attempt+1}/3 failed: {e}. Retrying...")
-            finally:
-                os.remove(upload_path)
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    @staticmethod
-    def _update_shard_index(output_dir, shard_name, episode_index, size_bytes):
-        index_path = os.path.join(output_dir, "shard_index.json")
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                index = json.load(f)
-        else:
-            index = {"shards": []}
-        index["shards"].append({
-            "file":       shard_name,
-            "size_bytes": size_bytes,
-            "episodes":   episode_index,
-        })
-        with open(index_path, "w") as f:
-            json.dump(index, f, indent=2)
+    def _flush_active_episode(self, state, dataset, writer):
+        if state["active_episode_idx"] is None or state["active_buffer"] is None or not state["active_buffer"]["tokens"]:
+            return
+        buf = state["active_buffer"]
+        order = np.argsort(buf["starts"])
+        episode_idx = int(state["active_episode_idx"])
+        sample_idx  = int(dataset.episode_plans[episode_idx]["sample_idx"])
+        tokens        = np.concatenate([buf["tokens"][i]        for i in order], axis=0)
+        actions       = np.concatenate([buf["actions"][i]       for i in order], axis=0)
+        states        = np.concatenate([buf["states"][i]        for i in order], axis=0)
+        frame_indices = np.concatenate([buf["frame_indices"][i] for i in order], axis=0)
+        T = tokens.shape[0]
+        for t in range(T):
+            writer.write({
+                "tokens":      tokens[t],
+                "actions":     actions[t],
+                "states":      states[t],
+                "frame_index": int(frame_indices[t]),
+                "episode_idx": episode_idx,
+                "sample_idx":  sample_idx,
+                "frame_pos":   t,
+                "episode_len": T,
+            })
+        state["encoded_episodes"] += 1
+        state["encoded_frames"] += T
+        state["active_episode_idx"] = None
+        state["active_buffer"] = None
