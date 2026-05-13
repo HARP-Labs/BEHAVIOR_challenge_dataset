@@ -5,10 +5,7 @@ numpy
 torch
 pyarrow
 tqdm
-lerobot
-opencv-python
 decord
 pyyaml
 transformers
-safetensors
 mosaicml-streaming
