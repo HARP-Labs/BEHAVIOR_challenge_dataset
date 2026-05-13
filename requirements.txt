@@ -8,4 +8,4 @@ tqdm
 decord
 pyyaml
 transformers
-streaming
+mosaicml-streaming>=0.8.0

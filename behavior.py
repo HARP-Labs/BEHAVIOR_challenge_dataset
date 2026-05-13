@@ -1,3 +1,10 @@
+import collections
+import collections.abc
+# Python 3.10+ removed collections.Iterator/Mapping/etc. — patch before streaming import
+for _name in ("Iterator", "Mapping", "MutableMapping", "Sequence", "MutableSequence", "Set"):
+    if not hasattr(collections, _name):
+        setattr(collections, _name, getattr(collections.abc, _name))
+
 import glob
 import json
 import os
