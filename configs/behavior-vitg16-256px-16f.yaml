@@ -8,7 +8,7 @@ data:
   datasets:
     - /content/base_dataset/manifest.json
   dataset_fpcs:
-    - 16
+    - 8
   batch_size: 1
   fps: 5
   crop_size: 256
