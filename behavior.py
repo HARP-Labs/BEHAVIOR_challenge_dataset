@@ -459,8 +459,6 @@ class BehaviorEpisodePreencoder:
         if output_dir:
             save_path = os.path.join(output_dir, shard_name)
             safetensors_save(tensors, save_path, metadata=metadata)
-            size_mb = os.path.getsize(save_path) / 1e6
-            logger.info(f"Saved shard {shard_id} with {len(episode_index)} episodes ({size_mb:.1f} MB) at {save_path}")
             self._update_shard_index(output_dir, shard_name, episode_index, tensors["tokens"].nbytes + tensors["actions"].nbytes + tensors["states"].nbytes + tensors["frame_indices"].nbytes)
         if hf_repo_id:
             path_in_repo = f"{hf_path_prefix.strip('/')}/{shard_name}".lstrip("/")
@@ -486,7 +484,6 @@ class BehaviorEpisodePreencoder:
             finally:
                 # Always remove: temp file (HF-only) or local shard file (output_dir+HF).
                 os.remove(upload_path)
-            logger.info(f"Uploaded shard {shard_id} with {len(episode_index)} episodes to hf://{hf_repo_id}/{path_in_repo}")
 
     @staticmethod
     def _update_shard_index(output_dir, shard_name, episode_index, size_bytes):
