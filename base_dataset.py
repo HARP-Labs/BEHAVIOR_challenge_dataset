@@ -220,6 +220,18 @@ class BaseDataset:
         )
 
         def _download_one(args):
+            """Download a single remote file and copy it to the local directory.
+
+            Args:
+                args: Tuple of ``(local_dir, remote_path, category)`` where
+                    ``local_dir`` is the destination ``Path``, ``remote_path``
+                    is the relative repo path, and ``category`` is a label
+                    (e.g. ``"data"``, ``"video"``, ``"meta"``) used in
+                    warning messages.
+
+            Returns:
+                Tuple of ``(file_size_bytes, exception_or_None)``.
+            """
             local_dir, remote_path, category = args
             try:
                 downloaded_path = load_from_huggingface(

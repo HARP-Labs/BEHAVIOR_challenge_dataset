@@ -12,12 +12,35 @@ class HFVJEPA2Encoder(torch.nn.Module):
     """Wrapper exposing HF V-JEPA2 encoder features as a plain tensor."""
 
     def __init__(self, hf_repo_id: str):
+        """Load the V-JEPA2 model and processor from a HuggingFace repository.
+
+        Args:
+            hf_repo_id: HuggingFace model repository ID
+                (e.g. ``"facebook/vjepa2-vitg-fpc64-256"``).
+        """
         super().__init__()
         self.model = AutoModel.from_pretrained(hf_repo_id)
         self.processor = AutoVideoProcessor.from_pretrained(hf_repo_id)
 
     def forward(self, video):
-      if video.ndim != 5:
+        """Run the V-JEPA2 encoder and return the last hidden state.
+
+        Accepts either ``[B, C, T, H, W]`` or ``[B, T, C, H, W]`` layout and
+        re-orders to ``[B, T, C, H, W]`` as expected by the HF model.
+
+        Args:
+            video: Float tensor of shape ``(B, C, T, H, W)`` or
+                ``(B, T, C, H, W)`` with 3 colour channels.
+
+        Returns:
+            ``torch.Tensor`` of shape ``(B, num_tokens, embed_dim)``
+            containing the last hidden state from the vision encoder.
+
+        Raises:
+            ValueError: If the tensor is not 5-D or the channel axis cannot be
+                identified.
+        """
+        if video.ndim != 5:
           raise ValueError(f"Expected 5D video tensor, got {tuple(video.shape)}")
       # behavior.py currently gives us [B, C, T, H, W].
       # Hugging Face VJEPA2 expects [B, T, C, H, W].
@@ -31,6 +54,17 @@ class HFVJEPA2Encoder(torch.nn.Module):
       return outputs.last_hidden_state
 
 def main(cfg_path: str):
+    """Build dataset, encoder, and pre-encoder from a YAML config, then run encoding.
+
+    Reads all parameters from the config file (data, model, output, meta, and
+    data_aug sections), constructs the ``BehaviorVideoDataset`` and
+    ``HFVJEPA2Encoder``, then calls
+    ``BehaviorEpisodePreencoder.encode_full_episodes`` to write MDS shards
+    locally and/or upload them to HuggingFace.
+
+    Args:
+        cfg_path: Path to the YAML configuration file.
+    """
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
     data_cfg = cfg["data"]
