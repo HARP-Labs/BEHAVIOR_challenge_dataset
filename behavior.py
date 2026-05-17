@@ -919,8 +919,14 @@ class BehaviorEpisodePreencoder:
             state["active_buffer"] = empty_buffer
         for view in views:
             state["active_buffer"][f"tokens_{view}"].append(tokens_by_view[view][b, :valid_steps])
-        # Take first frame of each tubelet for actions, states, and frame index.
-        state["active_buffer"]["actions"].append(batch["actions"][b, ::tps][:valid_steps])
+        # Actions: concatenate all tps sampled frames within each tubelet so that
+        # each stored row covers the full temporal span of its tubelet.
+        # Shape: (fpc, fstp*action_dim) → (num_steps, tps*fstp*action_dim)
+        act = batch["actions"][b]
+        num_steps = act.shape[0] // tps
+        act = act[: num_steps * tps].reshape(num_steps, tps * act.shape[-1])
+        state["active_buffer"]["actions"].append(act[:valid_steps])
+        # States: snapshot at the first sampled frame of each tubelet is sufficient.
         state["active_buffer"]["states"].append(batch["states"][b, ::tps][:valid_steps])
         state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, ::tps][:valid_steps])
         state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))

@@ -101,12 +101,12 @@ def main(cfg_path: str):
         motion_shift=aug_cfg.get("motion_shift", False),
         crop_size=data_cfg["crop_size"],
     )
-    dataset = BehaviorVideoDataset( #TODO drop last false ?
+    dataset = BehaviorVideoDataset(
         data_path=data_cfg["datasets"][0],
         fpcs=data_cfg["dataset_fpcs"][0],
         fps=data_cfg.get("fps"),
         transform=transform,
-        camera_frame=data_cfg.get("camera_frame", False),
+        camera_view=data_cfg.get("camera_view", "head"),
         state_start_idx=data_cfg.get("state_start_idx", 0),
         state_dim=data_cfg.get("state_dim", 7),
         action_dim=data_cfg.get("action_dim", 23),

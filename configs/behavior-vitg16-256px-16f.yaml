@@ -2,7 +2,7 @@ meta:
   dtype: bfloat16
 
 model:
-  hf_repo: facebook/vjepa2-vitg-fpc64-256
+  hf_repo: facebook/vjepa2-vitg-fpc64-256  # swap to any HF vjepa2 repo here
   temporal_patch_size: 2  # tubelet size; auto-detected from model config, this is the fallback
 
 data:
@@ -17,7 +17,7 @@ data:
   persistent_workers: true
   prefetch_factor: 4
   pin_mem: true
-  camera_frame: false
+  camera_view: head  # "head" or "multi" (head + left_wrist + right_wrist)
   state_start_idx: 0
   state_dim: 7
   action_dim: 23

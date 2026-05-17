@@ -303,7 +303,10 @@ class BaseDataset:
                 files_to_download.append((task_root / "meta", str(episode_rel), "meta"))
 
             for video_rel in episode.get("video_files", []):
-                files_to_download.append((task_root / "video", str(video_rel), "video"))
+                # Extract short view name from remote path, e.g.
+                # "videos/observation.images.rgb.head/chunk-000/episode_000000.mp4" → "head"
+                view_key = Path(video_rel).parent.parent.name.split(".")[-1]
+                files_to_download.append((task_root / "video" / view_key, str(video_rel), "video"))
         return files_to_download
 
     def _fetch_remote_file_sizes(self) -> dict[str, int]:
@@ -445,18 +448,18 @@ class BaseDataset:
         data_parquet_file = self.info["data_path"].format(**path_vars)
         episode_file = self.info["metainfo_path"].format(**path_vars)
 
-        if self.camera_view_type in {"all"}:
+        if self.camera_view_type == "multi":
             video_keys = [
                 "observation.images.rgb.head",
                 "observation.images.rgb.left_wrist",
                 "observation.images.rgb.right_wrist",
             ]
-        elif self.camera_view_type in {"head", "left_wrist", "right_wrist"}:
-            video_keys = [f"observation.images.rgb.{self.camera_view_type}"]
+        elif self.camera_view_type == "head":
+            video_keys = ["observation.images.rgb.head"]
         else:
             raise ValueError(
                 f"Unsupported camera_view_type '{self.camera_view_type}'. "
-                "Expected one of: all, head, left_wrist, right_wrist."
+                "Expected one of: head, multi."
             )
         video_files = [
             self.info["video_path"].format(**(path_vars | {"video_key": video_key}))
