@@ -35,6 +35,40 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         "multi": ["head", "left_wrist", "right_wrist"],
     }
 
+    # Curated proprioceptive state slices (indices into the 256-dim observation.state vector).
+    # Excludes simulator-only global state (base odometry, robot_pos, global orientation)
+    # and redundant arm sub-slices already covered by joint_qpos[6:28].
+    # Layout reference: R1Pro BEHAVIOR-2025 state vector documentation.
+    PROPRIO_SLICES = [
+        np.s_[6:28],    # joint_qpos: controllable joints only (torso+arms+grippers, no base odometry)
+        np.s_[34:56],   # joint_qpos_sin: controllable joints
+        np.s_[62:84],   # joint_qpos_cos: controllable joints
+        np.s_[84:112],  # joint_qvel: all joints (velocity is encoder-based, not odometric)
+        np.s_[112:140], # joint_qeffort: all joints (encodes contact events at grasp/collision)
+        np.s_[152:158], # robot_lin_vel + robot_ang_vel (IMU-observable on real robot)
+        np.s_[186:197], # eef_left_pos[3] + eef_left_quat[4] + gripper_left_qpos[2] + gripper_left_qvel[2]
+        np.s_[225:244], # eef_right_pos[3] + eef_right_quat[4] + gripper_right_qpos[2] + gripper_right_qvel[2]
+                        # + trunk_qpos[4] + trunk_qvel[4]
+        np.s_[253:256], # base_qvel (encoder velocity, not accumulated position)
+    ]
+    PROPRIO_DIM: int = 161  # sum of all PROPRIO_SLICES sizes
+
+    @staticmethod
+    def _extract_proprio(full_states: np.ndarray) -> np.ndarray:
+        """Extract the curated 161-dim proprioceptive vector from the full 256-dim state.
+
+        Args:
+            full_states: Float32 array of shape ``(T, 256)`` containing the raw
+                ``observation.state`` values for an episode.
+
+        Returns:
+            Float32 array of shape ``(T, 161)`` with simulator-only and redundant
+            dimensions removed.
+        """
+        return np.concatenate(
+            [full_states[:, s] for s in BehaviorVideoDataset.PROPRIO_SLICES], axis=1
+        )
+
     def __init__(
         self,
         data_path,
@@ -42,8 +76,6 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         fps=5,
         transform=None,
         camera_view="head",
-        state_start_idx=0,
-        state_dim=7,
         action_dim=23,
         cache_parquet=False,
         cache_video_readers=False,
@@ -59,9 +91,6 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 returned by decord before it is stored in the sample dict.
             camera_view: Which camera views to load. ``"head"`` loads only the
                 head camera; ``"multi"`` loads head, left_wrist, and right_wrist.
-            state_start_idx: Column offset into the ``observation.state`` array
-                from which ``state_dim`` values are sliced.
-            state_dim: Number of state dimensions to keep after slicing.
             action_dim: Number of action dimensions to keep (leading columns).
             cache_parquet: If True, keep loaded DataFrames in memory to avoid
                 repeated disk reads across workers.
@@ -77,8 +106,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.camera_view = camera_view
         self.views = self.CAMERA_VIEWS[camera_view]
-        self.state_start_idx = state_start_idx
-        self.state_dim = state_dim
+        self.state_dim = self.PROPRIO_DIM  # fixed 161-dim curated proprioceptive vector
         self.action_dim = action_dim
         self.cache_parquet = cache_parquet
         self.cache_video_readers = cache_video_readers
@@ -344,12 +372,12 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
 
         if full_actions.shape[1] < self.action_dim:
             raise ValueError(f"Action dim out of bounds for {ppath}: {full_actions.shape[1]=}, {self.action_dim=}")
-        if full_states.shape[1] < self.state_start_idx + self.state_dim:
+        if full_states.shape[1] < 256:
             raise ValueError(
-                f"State slice out of bounds for {ppath}: {full_states.shape[1]=}, {self.state_start_idx=}, {self.state_dim=}"
+                f"State vector too short for {ppath}: expected ≥256 dims, got {full_states.shape[1]}"
             )
 
-        states = full_states[:, self.state_start_idx : self.state_start_idx + self.state_dim]
+        states = self._extract_proprio(full_states)
         first_vr = self._get_video_reader(first_vpath)
         fstp = plan["fstp"]
         max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0], len(first_vr))
