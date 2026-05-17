@@ -30,13 +30,18 @@ logger = getLogger()
 class BehaviorVideoDataset(torch.utils.data.Dataset):
     """BEHAVIOR dataset with deterministic episode-chunk sampling for pre-encoding/training."""
 
+    CAMERA_VIEWS = {
+        "head":  ["head"],
+        "multi": ["head", "left_wrist", "right_wrist"],
+    }
+
     def __init__(
         self,
         data_path,
         fpcs=16,
         fps=5,
         transform=None,
-        camera_frame=False,
+        camera_view="head",
         state_start_idx=0,
         state_dim=7,
         action_dim=23,
@@ -52,7 +57,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 video FPS is used.
             transform: Optional callable applied to the raw uint8 video buffer
                 returned by decord before it is stored in the sample dict.
-            camera_frame: Reserved for future use; currently unused.
+            camera_view: Which camera views to load. ``"head"`` loads only the
+                head camera; ``"multi"`` loads head, left_wrist, and right_wrist.
             state_start_idx: Column offset into the ``observation.state`` array
                 from which ``state_dim`` values are sliced.
             state_dim: Number of state dimensions to keep after slicing.
@@ -62,12 +68,15 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             cache_video_readers: If True, keep ``VideoReader`` objects alive
                 between calls to ``loadvideo_decord``.
         """
+        if camera_view not in self.CAMERA_VIEWS:
+            raise ValueError(f"camera_view must be one of {list(self.CAMERA_VIEWS)}. Got: {camera_view!r}")
         self.data_path = data_path
         self.dataset_root = os.path.dirname(os.path.abspath(data_path))
         self.fpc = fpcs
         self.fps = fps
         self.transform = transform
-        self.camera_frame = camera_frame
+        self.camera_view = camera_view
+        self.views = self.CAMERA_VIEWS[camera_view]
         self.state_start_idx = state_start_idx
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -100,7 +109,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             manifest: Manifest dict as returned by ``_load_manifest``.
 
         Returns:
-            List of dicts, each containing ``video_path`` and ``parquet_path``.
+            List of dicts, each containing ``video_paths`` (a dict keyed by
+            view name) and ``parquet_path``.
 
         Raises:
             ValueError: If no valid episodes are found in the manifest.
@@ -114,10 +124,13 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 continue
             episode_name = os.path.splitext(os.path.basename(episode_file))[0]
             base = os.path.join(self.dataset_root, task_name)
-            video_path = os.path.join(base, "video", f"{episode_name}.mp4")
+            video_paths = {
+                view: os.path.join(base, "video", view, f"{episode_name}.mp4")
+                for view in self.views
+            }
             parquet_path = os.path.join(base, "data", f"{episode_name}.parquet")
             samples.append({
-                "video_path": video_path,
+                "video_paths": video_paths,
                 "parquet_path": parquet_path,
             })
 
@@ -181,7 +194,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         Raises:
             ValueError: If the configured FPS is not positive.
         """
-        vpath = sample["video_path"]
+        # Use the first view's video to determine FPS and length.
+        vpath = next(iter(sample["video_paths"].values()))
         ppath = sample["parquet_path"]
         vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
         try:
@@ -261,7 +275,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         max_retries = 10
         for attempt in range(max_retries):
             try:
-                buffer, actions, states, indices = self.loadvideo_decord(sample, plan, start_idx=start_idx)
+                buffers, actions, states, indices = self.loadvideo_decord(sample, plan, start_idx=start_idx)
                 break
             except Exception as e:
                 logger.warning(f"Attempt {attempt+1}/{max_retries} failed for sample={sample} {e=}")
@@ -273,7 +287,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
 
         valid_len = min(self.fpc, len(plan["indices"]) - start_idx)
         return {
-            "video": buffer,
+            "video": buffers,
             "actions": actions,
             "states": states,
             "frame_indices": indices,
@@ -286,21 +300,23 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         """Load a clip window from disk and return frames, actions, and states.
 
         Reads the parquet file for states/actions and the corresponding video
-        frames via decord.  Short windows at the end of an episode are
-        right-padded with the last valid frame/action/state.
+        frames via decord for each configured camera view.  Short windows at
+        the end of an episode are right-padded with the last valid
+        frame/action/state.
 
         Args:
-            sample: Dict with ``video_path`` and ``parquet_path`` keys.
+            sample: Dict with ``video_paths`` (dict keyed by view name) and
+                ``parquet_path`` keys.
             plan: Episode plan dict produced by ``_build_episode_plans``,
                 containing ``indices``, ``fstp``, and ``max_len``.
             start_idx: Offset (in sampled-index space) of the clip window
                 within the episode.
 
         Returns:
-            Tuple of ``(buffer, actions, states, window_indices)`` where
-            ``buffer`` is a ``uint8`` ndarray of shape
-            ``(fpc, H, W, C)``, ``actions`` and ``states`` are ``float32``
-            ndarrays of shape ``(fpc, action_dim*fstp)`` and
+            Tuple of ``(buffers, actions, states, window_indices)`` where
+            ``buffers`` is a dict keyed by view name, each value a ``uint8``
+            ndarray of shape ``(fpc, H, W, C)``.  ``actions`` and ``states``
+            are ``float32`` ndarrays of shape ``(fpc, action_dim*fstp)`` and
             ``(fpc, state_dim)`` respectively, and ``window_indices`` is an
             ``int64`` ndarray of the actual video frame positions.
 
@@ -309,7 +325,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 dimensions are too small for the configured slice parameters.
             RuntimeError: If the episode plan contains no valid indices.
         """
-        vpath = sample["video_path"]
+        # Use the first view's reader to determine episode length bounds.
+        first_vpath = next(iter(sample["video_paths"].values()))
         ppath = sample["parquet_path"]
         df = self._load_parquet(ppath)
         if "observation.state" not in df.columns or "action" not in df.columns:
@@ -325,13 +342,13 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             )
 
         states = full_states[:, self.state_start_idx : self.state_start_idx + self.state_dim]
-        vr = self._get_video_reader(vpath)
+        first_vr = self._get_video_reader(first_vpath)
         fstp = plan["fstp"]
-        max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0], len(vr))
+        max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0], len(first_vr))
         indices = plan["indices"]
 
         if len(indices) == 0:
-            raise RuntimeError(f"No indices in episode plan for {vpath=}, {fstp=}, {max_len=}")
+            raise RuntimeError(f"No indices in episode plan for {first_vpath=}, {fstp=}, {max_len=}")
 
         end_idx = min(start_idx + self.fpc, len(indices))
         real_window_indices = indices[start_idx:end_idx]
@@ -361,7 +378,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             states.append(raw_states[start])
 
             if len(action_chunk) == 0:
-                logger.warning(f"Empty action chunk for {vpath=}, {start=}, {end=}")
+                logger.warning(f"Empty action chunk for {first_vpath=}, {start=}, {end=}")
                 action_chunk = np.zeros((fstp, self.action_dim), dtype=np.float32)
             elif len(action_chunk) < fstp:
                 pad = np.repeat(action_chunk[-1:], fstp - len(action_chunk), axis=0)
@@ -373,11 +390,16 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
 
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
-        vr.seek(0)
-        buffer = vr.get_batch(window_indices).asnumpy()
-        if self.transform is not None:
-            buffer = self.transform(buffer)
-        return buffer, actions, states, window_indices
+
+        buffers = {}
+        for view, vpath in sample["video_paths"].items():
+            vr = self._get_video_reader(vpath)
+            vr.seek(0)
+            buf = vr.get_batch(window_indices).asnumpy()
+            if self.transform is not None:
+                buf = self.transform(buf)
+            buffers[view] = buf
+        return buffers, actions, states, window_indices
 
     def _load_parquet(self, ppath):
         """Load a parquet file, optionally from the in-memory cache.
@@ -598,8 +620,12 @@ class BehaviorEpisodePreencoder:
             Dict mapping each key to a stacked numpy array with an added
             leading batch dimension.
         """
+        views = list(batch[0]["video"].keys())
         return {
-            "video": np.stack([item["video"] for item in batch], axis=0),
+            "video": {
+                view: np.stack([item["video"][view] for item in batch], axis=0)
+                for view in views
+            },
             "actions": np.stack([item["actions"] for item in batch], axis=0),
             "states": np.stack([item["states"] for item in batch], axis=0),
             "frame_indices": np.stack([item["frame_indices"] for item in batch], axis=0),
@@ -630,8 +656,7 @@ class BehaviorEpisodePreencoder:
         except Exception:
             return "gpu=n/a"
 
-    _MDS_COLUMNS = {
-        "tokens":      "ndarray",   # (tokens_per_step, embed_dim) — one tubelet
+    _MDS_COLUMNS_BASE = {
         "actions":     "ndarray",   # (fstp * action_dim,) — first frame of the tubelet
         "states":      "ndarray",   # (state_dim,)          — first frame of the tubelet
         "frame_index": "int",       # source video frame index at tubelet start
@@ -640,6 +665,16 @@ class BehaviorEpisodePreencoder:
         "step_pos":    "int",       # tubelet position within episode (0-indexed)
         "episode_len": "int",       # total tubelet steps in episode
     }
+
+    @staticmethod
+    def _mds_columns(views):
+        """Build the MDS column schema for the given list of view names.
+
+        Each view gets its own ``tokens_<view>`` ndarray column
+        of shape ``(tokens_per_step, embed_dim)``.
+        """
+        token_cols = {f"tokens_{view}": "ndarray" for view in views}
+        return {**token_cols, **BehaviorEpisodePreencoder._MDS_COLUMNS_BASE}
 
     @torch.inference_mode()
     def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=8, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2):
@@ -710,15 +745,21 @@ class BehaviorEpisodePreencoder:
             )
             uploader.start()
 
+        views = dataset.views
+        mds_columns = self._mds_columns(views)
         try:
-            with MDSWriter(out=write_dir, columns=self._MDS_COLUMNS, size_limit=max_shard_bytes) as writer:
+            with MDSWriter(out=write_dir, columns=mds_columns, size_limit=max_shard_bytes) as writer:
                 pbar = tqdm(data_loader, desc="Encoding batches")
                 for batch_idx, batch in enumerate(pbar):
                     if batch_idx % 10 == 0:
                         pbar.set_postfix_str(self._gpu_status())
-                    tokens = self._encode_batch(batch["video"], dataset.fpc, self.temporal_patch_size)
-                    for b in range(tokens.shape[0]):
-                        self._accumulate(state, dataset, writer, tokens, batch, b)
+                    tokens_by_view = {
+                        view: self._encode_batch(batch["video"][view], dataset.fpc, self.temporal_patch_size)
+                        for view in views
+                    }
+                    batch_size = next(iter(tokens_by_view.values())).shape[0]
+                    for b in range(batch_size):
+                        self._accumulate(state, dataset, writer, tokens_by_view, batch, b)
                 self._flush_active_episode(state, dataset, writer)
             # MDSWriter context exit writes the final shard and index.json.
             if uploader:
@@ -745,20 +786,24 @@ class BehaviorEpisodePreencoder:
                 up the original ``sample_idx`` for each episode.
             writer: Open ``MDSWriter`` instance to write samples into.
         """
-        if state["active_episode_idx"] is None or state["active_buffer"] is None or not state["active_buffer"]["tokens"]:
+        views = [k[len("tokens_"):] for k in state["active_buffer"] if k.startswith("tokens_")]
+        if state["active_episode_idx"] is None or state["active_buffer"] is None or not views or not state["active_buffer"][f"tokens_{views[0]}"]:
             return
         buf = state["active_buffer"]
         order = np.argsort(buf["starts"])
         episode_idx = int(state["active_episode_idx"])
         sample_idx  = int(dataset.episode_plans[episode_idx]["sample_idx"])
-        tokens        = np.concatenate([buf["tokens"][i]        for i in order], axis=0)
+        tokens_by_view = {
+            view: np.concatenate([buf[f"tokens_{view}"][i] for i in order], axis=0)
+            for view in views
+        }
         actions       = np.concatenate([buf["actions"][i]       for i in order], axis=0)
         states        = np.concatenate([buf["states"][i]        for i in order], axis=0)
         frame_indices = np.concatenate([buf["frame_indices"][i] for i in order], axis=0)
-        T = tokens.shape[0]
+        T = next(iter(tokens_by_view.values())).shape[0]
         for t in range(T):
             writer.write({
-                "tokens":      tokens[t],
+                **{f"tokens_{view}": tokens_by_view[view][t] for view in views},
                 "actions":     actions[t],
                 "states":      states[t],
                 "frame_index": int(frame_indices[t]),
@@ -837,7 +882,7 @@ class BehaviorEpisodePreencoder:
         tokens_per_step = tokens.shape[1] // num_steps
         return tokens.reshape(tokens.shape[0], num_steps, tokens_per_step, tokens.shape[2])
 
-    def _accumulate(self, state, dataset, writer, tokens, batch, b):
+    def _accumulate(self, state, dataset, writer, tokens_by_view, batch, b):
         """Accumulate encoded windows into the active episode buffer.
 
         ``tokens`` are already in tubelet-step space
@@ -852,9 +897,9 @@ class BehaviorEpisodePreencoder:
             state: Mutable state dict maintained by ``encode_full_episodes``.
             dataset: The source ``BehaviorVideoDataset``.
             writer: Open ``MDSWriter`` instance.
-            tokens: Encoded token array of shape
-                ``(B, num_steps, tokens_per_step, embed_dim)`` as returned by
-                ``_encode_batch``.
+            tokens_by_view: Dict mapping view name to encoded token array of
+                shape ``(B, num_steps, tokens_per_step, embed_dim)`` as
+                returned by ``_encode_batch``.
             batch: Collated batch dict from the data loader.
             b: Batch index of the sample to accumulate.
         """
@@ -863,14 +908,17 @@ class BehaviorEpisodePreencoder:
         tps = self.temporal_patch_size
         # Round up: a tubelet is valid if its first frame is valid.
         valid_steps = (valid_len + tps - 1) // tps
+        views = list(tokens_by_view.keys())
+        empty_buffer = {f"tokens_{view}": [] for view in views} | {"actions": [], "states": [], "frame_indices": [], "starts": []}
         if state["active_episode_idx"] is None:
             state["active_episode_idx"] = episode_idx
-            state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
+            state["active_buffer"] = empty_buffer
         elif episode_idx != state["active_episode_idx"]:
             self._flush_active_episode(state, dataset, writer)
             state["active_episode_idx"] = episode_idx
-            state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
-        state["active_buffer"]["tokens"].append(tokens[b, :valid_steps])
+            state["active_buffer"] = empty_buffer
+        for view in views:
+            state["active_buffer"][f"tokens_{view}"].append(tokens_by_view[view][b, :valid_steps])
         # Take first frame of each tubelet for actions, states, and frame index.
         state["active_buffer"]["actions"].append(batch["actions"][b, ::tps][:valid_steps])
         state["active_buffer"]["states"].append(batch["states"][b, ::tps][:valid_steps])
