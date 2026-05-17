@@ -347,12 +347,14 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 within the episode.
 
         Returns:
-            Tuple of ``(buffers, actions, states, window_indices)`` where
-            ``buffers`` is a dict keyed by view name, each value a ``uint8``
-            ndarray of shape ``(fpc, H, W, C)``.  ``actions`` and ``states``
-            are ``float32`` ndarrays of shape ``(fpc, action_dim*fstp)`` and
-            ``(fpc, state_dim)`` respectively, and ``window_indices`` is an
-            ``int64`` ndarray of the actual video frame positions.
+            Tuple of ``(buffers, actions, states, cam_rel_poses, window_indices)``
+            where ``buffers`` is a dict keyed by view name, each value a ``uint8``
+            ndarray of shape ``(fpc, H, W, C)``.  ``actions`` is a ``float32``
+            ndarray of shape ``(fpc+1, fstp*action_dim)`` — one extra chunk beyond
+            the clip for future-action alignment.  ``states`` and ``cam_rel_poses``
+            are ``float32`` ndarrays of shape ``(fpc, state_dim)`` and
+            ``(fpc, 21)`` respectively.  ``window_indices`` is an ``int64``
+            ndarray of the actual video frame positions.
 
         Raises:
             ValueError: If required parquet columns are missing or array

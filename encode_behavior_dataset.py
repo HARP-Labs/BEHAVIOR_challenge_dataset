@@ -54,17 +54,16 @@ class HFVJEPA2Encoder(torch.nn.Module):
                 identified.
         """
         if video.ndim != 5:
-          raise ValueError(f"Expected 5D video tensor, got {tuple(video.shape)}")
-      # behavior.py currently gives us [B, C, T, H, W].
-      # Hugging Face VJEPA2 expects [B, T, C, H, W].
-      if video.shape[1] == 3:
-          video = video.permute(0, 2, 1, 3, 4).contiguous()
-      elif video.shape[2] == 3:
-          video = video.contiguous()
-      else:
-          raise ValueError(f"Unable to infer channel axis, got {tuple(video.shape)}")
-      outputs = self.model(pixel_values_videos=video)
-      return outputs.last_hidden_state
+            raise ValueError(f"Expected 5D video tensor, got {tuple(video.shape)}")
+        # behavior.py gives us [B, C, T, H, W]; HF VJEPA2 expects [B, T, C, H, W].
+        if video.shape[1] == 3:
+            video = video.permute(0, 2, 1, 3, 4).contiguous()
+        elif video.shape[2] == 3:
+            video = video.contiguous()
+        else:
+            raise ValueError(f"Unable to infer channel axis, got {tuple(video.shape)}")
+        outputs = self.model(pixel_values_videos=video)
+        return outputs.last_hidden_state
 
 def main(cfg_path: str):
     """Build dataset, encoder, and pre-encoder from a YAML config, then run encoding.

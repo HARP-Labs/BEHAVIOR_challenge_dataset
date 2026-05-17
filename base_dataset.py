@@ -466,9 +466,12 @@ class BaseDataset:
             for video_key in video_keys
         ]
 
+        # Sanitize task_name to match the directory created by _build_download_targets.
+        import re as _re
+        safe_task_name = _re.sub(r"[^a-zA-Z0-9._-]+", "_", task_name or "unknown_task").strip("_") or "unknown_task"
         return {
             "task": task_desc,
-            "task_name": task_name,
+            "task_name": safe_task_name,
             "task_index": task_index,
             "episode_index": sampled_id,
             "duration_minutes": duration_minutes,
