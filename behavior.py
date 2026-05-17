@@ -17,7 +17,12 @@ from logging import getLogger
 from math import ceil
 from tqdm import tqdm
 import numpy as np
+import logging as _logging
 from streaming import MDSWriter
+
+# Suppress verbose output from mosaicml-streaming and huggingface_hub.
+for _noisy_lib in ("streaming", "huggingface_hub"):
+    _logging.getLogger(_noisy_lib).setLevel(_logging.ERROR)
 import pandas as pd
 import torch
 import torch.utils.data
@@ -528,6 +533,13 @@ class _ShardUploader:
         self._repo_id      = repo_id
         self._path_in_repo = path_in_repo
         self._delete_local = delete_local
+        # Suppress per-file upload progress bars and verbose HF hub logging.
+        try:
+            import huggingface_hub.utils as _hf_utils
+            _hf_utils.logging.disable_progress_bars()
+            _hf_utils.logging.set_verbosity_error()
+        except Exception:
+            pass
         self._uploaded     = set()
         self._error        = None
         self._stop         = threading.Event()
