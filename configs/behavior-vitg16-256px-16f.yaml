@@ -19,7 +19,7 @@ data:
   pin_mem: true
   camera_view: head  # "head" or "multi" (head + left_wrist + right_wrist)
   state_start_idx: 0
-  state_dim: 7
+  state_dim: 256   # full observation.state vector; mask joint_qeffort slice at training time
   action_dim: 23
   cache_parquet: false
   cache_video_readers: false

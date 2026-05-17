@@ -275,7 +275,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         max_retries = 10
         for attempt in range(max_retries):
             try:
-                buffers, actions, states, indices = self.loadvideo_decord(sample, plan, start_idx=start_idx)
+                buffers, actions, states, cam_rel_poses, indices = self.loadvideo_decord(sample, plan, start_idx=start_idx)
                 break
             except Exception as e:
                 logger.warning(f"Attempt {attempt+1}/{max_retries} failed for sample={sample} {e=}")
@@ -290,6 +290,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             "video": buffers,
             "actions": actions,
             "states": states,
+            "cam_rel_poses": cam_rel_poses,
             "frame_indices": indices,
             "episode_idx": episode_idx,
             "start_idx": start_idx,
@@ -333,6 +334,13 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             raise ValueError(f"Expected `observation.state` and `action` in parquet: {ppath}")
         full_states = np.asarray(df["observation.state"].to_list(), dtype=np.float32)
         full_actions = np.asarray(df["action"].to_list(), dtype=np.float32)
+        # cam_rel_poses: 21-dim (3 cameras × position[3] + quaternion[4]).
+        # Zeroed out gracefully when the column is absent.
+        if "observation.cam_rel_poses" in df.columns:
+            full_cam_rel_poses = np.asarray(df["observation.cam_rel_poses"].to_list(), dtype=np.float32)
+        else:
+            logger.warning(f"observation.cam_rel_poses missing in {ppath}, filling with zeros")
+            full_cam_rel_poses = np.zeros((len(full_states), 21), dtype=np.float32)
 
         if full_actions.shape[1] < self.action_dim:
             raise ValueError(f"Action dim out of bounds for {ppath}: {full_actions.shape[1]=}, {self.action_dim=}")
@@ -360,13 +368,16 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
 
         raw_states = states
         raw_actions = full_actions[:, : self.action_dim]
+        raw_cam_rel_poses = full_cam_rel_poses
         states = []
         actions = []
+        cam_rel_poses = []
         for i, start in enumerate(window_indices):
             start = int(start)
             if start >= max_len:
                 states.append(np.zeros(self.state_dim, dtype=np.float32))
                 actions.append(np.zeros(fstp * self.action_dim, dtype=np.float32))
+                cam_rel_poses.append(np.zeros(21, dtype=np.float32))
                 continue
             if i + 1 < len(real_window_indices):
                 next_start = int(real_window_indices[i + 1])
@@ -376,6 +387,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             action_chunk = raw_actions[start:end]
 
             states.append(raw_states[start])
+            cam_rel_poses.append(raw_cam_rel_poses[start])
 
             if len(action_chunk) == 0:
                 logger.warning(f"Empty action chunk for {first_vpath=}, {start=}, {end=}")
@@ -390,6 +402,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
 
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
+        cam_rel_poses = np.asarray(cam_rel_poses, dtype=np.float32)
 
         buffers = {}
         for view, vpath in sample["video_paths"].items():
@@ -399,7 +412,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             if self.transform is not None:
                 buf = self.transform(buf)
             buffers[view] = buf
-        return buffers, actions, states, window_indices
+        return buffers, actions, states, cam_rel_poses, window_indices
 
     def _load_parquet(self, ppath):
         """Load a parquet file, optionally from the in-memory cache.
@@ -628,6 +641,7 @@ class BehaviorEpisodePreencoder:
             },
             "actions": np.stack([item["actions"] for item in batch], axis=0),
             "states": np.stack([item["states"] for item in batch], axis=0),
+            "cam_rel_poses": np.stack([item["cam_rel_poses"] for item in batch], axis=0),
             "frame_indices": np.stack([item["frame_indices"] for item in batch], axis=0),
             "episode_idx": np.asarray([item["episode_idx"] for item in batch], dtype=np.int64),
             "start_idx": np.asarray([item["start_idx"] for item in batch], dtype=np.int64),
@@ -657,13 +671,14 @@ class BehaviorEpisodePreencoder:
             return "gpu=n/a"
 
     _MDS_COLUMNS_BASE = {
-        "actions":     "ndarray",   # (fstp * action_dim,) — first frame of the tubelet
-        "states":      "ndarray",   # (state_dim,)          — first frame of the tubelet
-        "frame_index": "int",       # source video frame index at tubelet start
-        "episode_idx": "int",
-        "sample_idx":  "int",
-        "step_pos":    "int",       # tubelet position within episode (0-indexed)
-        "episode_len": "int",       # total tubelet steps in episode
+        "actions":       "ndarray",  # (tps * fstp * action_dim,) — all frames within tubelet
+        "states":        "ndarray",  # (state_dim,)  — first sampled frame of tubelet
+        "cam_rel_poses": "ndarray",  # (21,) — 3 cameras × (pos[3] + quat[4]), first frame of tubelet
+        "frame_index":   "int",      # source video frame index at tubelet start
+        "episode_idx":   "int",
+        "sample_idx":    "int",
+        "step_pos":      "int",      # tubelet position within episode (0-indexed)
+        "episode_len":   "int",      # total tubelet steps in episode
     }
 
     @staticmethod
@@ -799,18 +814,20 @@ class BehaviorEpisodePreencoder:
         }
         actions       = np.concatenate([buf["actions"][i]       for i in order], axis=0)
         states        = np.concatenate([buf["states"][i]        for i in order], axis=0)
+        cam_rel_poses = np.concatenate([buf["cam_rel_poses"][i] for i in order], axis=0)
         frame_indices = np.concatenate([buf["frame_indices"][i] for i in order], axis=0)
         T = next(iter(tokens_by_view.values())).shape[0]
         for t in range(T):
             writer.write({
                 **{f"tokens_{view}": tokens_by_view[view][t] for view in views},
-                "actions":     actions[t],
-                "states":      states[t],
-                "frame_index": int(frame_indices[t]),
-                "episode_idx": episode_idx,
-                "sample_idx":  sample_idx,
-                "step_pos":    t,
-                "episode_len": T,
+                "actions":       actions[t],
+                "states":        states[t],
+                "cam_rel_poses": cam_rel_poses[t],
+                "frame_index":   int(frame_indices[t]),
+                "episode_idx":   episode_idx,
+                "sample_idx":    sample_idx,
+                "step_pos":      t,
+                "episode_len":   T,
             })
         state["encoded_episodes"] += 1
         state["encoded_frames"] += T
@@ -909,7 +926,7 @@ class BehaviorEpisodePreencoder:
         # Round up: a tubelet is valid if its first frame is valid.
         valid_steps = (valid_len + tps - 1) // tps
         views = list(tokens_by_view.keys())
-        empty_buffer = {f"tokens_{view}": [] for view in views} | {"actions": [], "states": [], "frame_indices": [], "starts": []}
+        empty_buffer = {f"tokens_{view}": [] for view in views} | {"actions": [], "states": [], "cam_rel_poses": [], "frame_indices": [], "starts": []}
         if state["active_episode_idx"] is None:
             state["active_episode_idx"] = episode_idx
             state["active_buffer"] = empty_buffer
@@ -926,7 +943,8 @@ class BehaviorEpisodePreencoder:
         num_steps = act.shape[0] // tps
         act = act[: num_steps * tps].reshape(num_steps, tps * act.shape[-1])
         state["active_buffer"]["actions"].append(act[:valid_steps])
-        # States: snapshot at the first sampled frame of each tubelet is sufficient.
+        # States and cam_rel_poses: snapshot at the first sampled frame of each tubelet.
         state["active_buffer"]["states"].append(batch["states"][b, ::tps][:valid_steps])
+        state["active_buffer"]["cam_rel_poses"].append(batch["cam_rel_poses"][b, ::tps][:valid_steps])
         state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, ::tps][:valid_steps])
         state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
