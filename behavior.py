@@ -522,7 +522,7 @@ class _ShardUploader:
 class BehaviorEpisodePreencoder:
     """Run a vision encoder on BEHAVIOR clips and save pre-encoded episode shards."""
 
-    def __init__(self, encoder, device=None, dtype=torch.float32):
+    def __init__(self, encoder, device=None, dtype=torch.float32, temporal_patch_size: int = 2):
         """Initialize the pre-encoder and move the encoder model to the target device.
 
         Args:
@@ -534,8 +534,12 @@ class BehaviorEpisodePreencoder:
             dtype: Floating-point dtype used for encoder inputs and outputs.
                 ``bfloat16`` outputs are cast to ``float16`` before being saved
                 to disk.
+            temporal_patch_size: Number of input frames grouped into one tubelet
+                by the encoder's patch embedding.  V-JEPA2 uses 2.  Must evenly
+                divide ``fpc`` at encode time.
         """
         self.encoder = encoder.eval()
+        self.temporal_patch_size = temporal_patch_size
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.dtype = dtype
         self.encoder.to(self.device)
@@ -627,14 +631,14 @@ class BehaviorEpisodePreencoder:
             return "gpu=n/a"
 
     _MDS_COLUMNS = {
-        "tokens":      "ndarray",
-        "actions":     "ndarray",
-        "states":      "ndarray",
-        "frame_index": "int",
+        "tokens":      "ndarray",   # (tokens_per_step, embed_dim) — one tubelet
+        "actions":     "ndarray",   # (fstp * action_dim,) — first frame of the tubelet
+        "states":      "ndarray",   # (state_dim,)          — first frame of the tubelet
+        "frame_index": "int",       # source video frame index at tubelet start
         "episode_idx": "int",
         "sample_idx":  "int",
-        "frame_pos":   "int",
-        "episode_len": "int",
+        "step_pos":    "int",       # tubelet position within episode (0-indexed)
+        "episode_len": "int",       # total tubelet steps in episode
     }
 
     @torch.inference_mode()
@@ -672,6 +676,12 @@ class BehaviorEpisodePreencoder:
         """
         if not output_dir and not hf_repo_id:
             raise ValueError("Either output_dir or hf_repo_id must be provided")
+        fpc = dataset.fpc
+        tps = self.temporal_patch_size
+        if fpc % tps != 0:
+            raise ValueError(
+                f"fpc ({fpc}) must be divisible by temporal_patch_size ({tps})"
+            )
 
         tmp_dir = None
         if output_dir:
@@ -706,7 +716,7 @@ class BehaviorEpisodePreencoder:
                 for batch_idx, batch in enumerate(pbar):
                     if batch_idx % 10 == 0:
                         pbar.set_postfix_str(self._gpu_status())
-                    tokens = self._encode_batch(batch["video"], dataset.fpc)
+                    tokens = self._encode_batch(batch["video"], dataset.fpc, self.temporal_patch_size)
                     for b in range(tokens.shape[0]):
                         self._accumulate(state, dataset, writer, tokens, batch, b)
                 self._flush_active_episode(state, dataset, writer)
@@ -754,7 +764,7 @@ class BehaviorEpisodePreencoder:
                 "frame_index": int(frame_indices[t]),
                 "episode_idx": episode_idx,
                 "sample_idx":  sample_idx,
-                "frame_pos":   t,
+                "step_pos":    t,
                 "episode_len": T,
             })
         state["encoded_episodes"] += 1
@@ -789,36 +799,51 @@ class BehaviorEpisodePreencoder:
             collate_fn=self.behavior_preencode_collate,
         )
 
-    def _encode_batch(self, video, fpc):
-        """Encode a batch of video clips and reshape tokens per frame.
+    def _encode_batch(self, video, fpc, temporal_patch_size):
+        """Encode a batch of video clips and reshape tokens per tubelet step.
+
+        The encoder's 3-D tubelet patch embedding groups ``temporal_patch_size``
+        consecutive frames into one token sequence.  With ``fpc`` input frames
+        the encoder produces ``num_steps = fpc // temporal_patch_size`` temporal
+        steps, each containing ``tokens_per_step = total_tokens / num_steps``
+        spatial patch tokens.
 
         Args:
             video: Raw video array of shape ``(B, T, H, W, C)`` or any layout
                 accepted by ``_to_video_tensor``.
-            fpc: Frames per clip; used to split the flat token sequence into
-                per-frame groups.
+            fpc: Frames per clip fed to the encoder.
+            temporal_patch_size: Number of frames per tubelet (e.g. 2 for
+                V-JEPA2).  Must evenly divide ``fpc``.
 
         Returns:
-            ``float32`` numpy array of shape
-            ``(B, fpc, tokens_per_frame, embed_dim)``.
+            ``float32`` (or ``float16``) numpy array of shape
+            ``(B, num_steps, tokens_per_step, embed_dim)`` where
+            ``num_steps = fpc // temporal_patch_size``.
 
         Raises:
-            AssertionError: If the total number of tokens is not divisible by
-                ``fpc``.
+            AssertionError: If total encoder tokens are not divisible by
+                ``num_steps``.
         """
         tokens = self.encoder(self._to_video_tensor(video))
         if isinstance(tokens, (tuple, list)):
             tokens = tokens[0]
         storage_dtype = torch.float16 if self.dtype == torch.bfloat16 else self.dtype
         tokens = tokens.detach().cpu().to(storage_dtype).numpy()
-        assert tokens.shape[1] % fpc == 0, (
-            f"Encoder output tokens ({tokens.shape[1]}) not divisible by fpc ({fpc})"
+        num_steps = fpc // temporal_patch_size
+        assert tokens.shape[1] % num_steps == 0, (
+            f"Encoder output tokens ({tokens.shape[1]}) not divisible by "
+            f"num_steps ({num_steps}) = fpc ({fpc}) // temporal_patch_size ({temporal_patch_size})"
         )
-        tokens_per_frame = tokens.shape[1] // fpc
-        return tokens.reshape(tokens.shape[0], fpc, tokens_per_frame, tokens.shape[2])
+        tokens_per_step = tokens.shape[1] // num_steps
+        return tokens.reshape(tokens.shape[0], num_steps, tokens_per_step, tokens.shape[2])
 
     def _accumulate(self, state, dataset, writer, tokens, batch, b):
         """Accumulate encoded windows into the active episode buffer.
+
+        ``tokens`` are already in tubelet-step space
+        ``(B, num_steps, tokens_per_step, embed_dim)``.  Actions, states, and
+        frame indices are downsampled from frame space to step space by taking
+        the first frame of each tubelet (stride ``temporal_patch_size``).
 
         When the episode index changes, the previous episode is flushed to the
         MDS writer before starting a new buffer.
@@ -828,13 +853,16 @@ class BehaviorEpisodePreencoder:
             dataset: The source ``BehaviorVideoDataset``.
             writer: Open ``MDSWriter`` instance.
             tokens: Encoded token array of shape
-                ``(B, fpc, tokens_per_frame, embed_dim)`` as returned by
+                ``(B, num_steps, tokens_per_step, embed_dim)`` as returned by
                 ``_encode_batch``.
             batch: Collated batch dict from the data loader.
             b: Batch index of the sample to accumulate.
         """
         episode_idx = int(batch["episode_idx"][b])
         valid_len   = int(batch["valid_len"][b])
+        tps = self.temporal_patch_size
+        # Round up: a tubelet is valid if its first frame is valid.
+        valid_steps = (valid_len + tps - 1) // tps
         if state["active_episode_idx"] is None:
             state["active_episode_idx"] = episode_idx
             state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
@@ -842,8 +870,9 @@ class BehaviorEpisodePreencoder:
             self._flush_active_episode(state, dataset, writer)
             state["active_episode_idx"] = episode_idx
             state["active_buffer"] = {"tokens": [], "actions": [], "states": [], "frame_indices": [], "starts": []}
-        state["active_buffer"]["tokens"].append(tokens[b, :valid_len])
-        state["active_buffer"]["actions"].append(batch["actions"][b, :valid_len])
-        state["active_buffer"]["states"].append(batch["states"][b, :valid_len])
-        state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_len])
+        state["active_buffer"]["tokens"].append(tokens[b, :valid_steps])
+        # Take first frame of each tubelet for actions, states, and frame index.
+        state["active_buffer"]["actions"].append(batch["actions"][b, ::tps][:valid_steps])
+        state["active_buffer"]["states"].append(batch["states"][b, ::tps][:valid_steps])
+        state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, ::tps][:valid_steps])
         state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))

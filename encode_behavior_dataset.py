@@ -11,16 +11,29 @@ from behavior import BehaviorEpisodePreencoder, BehaviorVideoDataset
 class HFVJEPA2Encoder(torch.nn.Module):
     """Wrapper exposing HF V-JEPA2 encoder features as a plain tensor."""
 
-    def __init__(self, hf_repo_id: str):
+    def __init__(self, hf_repo_id: str, temporal_patch_size: int = 2):
         """Load the V-JEPA2 model and processor from a HuggingFace repository.
 
         Args:
             hf_repo_id: HuggingFace model repository ID
                 (e.g. ``"facebook/vjepa2-vitg-fpc64-256"``).
+            temporal_patch_size: Fallback tubelet size used when the model
+                config does not expose one explicitly.  Defaults to 2.
         """
         super().__init__()
         self.model = AutoModel.from_pretrained(hf_repo_id)
         self.processor = AutoVideoProcessor.from_pretrained(hf_repo_id)
+        self._temporal_patch_size_fallback = temporal_patch_size
+
+    @property
+    def temporal_patch_size(self) -> int:
+        """Tubelet temporal size read from the model config, with fallback."""
+        cfg = self.model.config
+        for attr in ("tubelet_size", "temporal_patch_size", "video_tubelet_size"):
+            val = getattr(cfg, attr, None)
+            if val is not None:
+                return int(val)
+        return self._temporal_patch_size_fallback
 
     def forward(self, video):
         """Run the V-JEPA2 encoder and return the last hidden state.
@@ -76,7 +89,8 @@ def main(cfg_path: str):
     dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     hf_repo_id = model_cfg.get("hf_repo", "facebook/vjepa2-vitg-fpc64-256")
-    encoder = HFVJEPA2Encoder(hf_repo_id=hf_repo_id).to(device)
+    temporal_patch_size = model_cfg.get("temporal_patch_size", 2)
+    encoder = HFVJEPA2Encoder(hf_repo_id=hf_repo_id, temporal_patch_size=temporal_patch_size).to(device)
     
     transform = make_transforms(
         random_horizontal_flip=aug_cfg.get("horizontal_flip", False),
@@ -100,7 +114,13 @@ def main(cfg_path: str):
         cache_video_readers=data_cfg.get("cache_video_readers", False),
     )
 
-    preencoder = BehaviorEpisodePreencoder(encoder=encoder, device=device, dtype=dtype)
+    preencoder = BehaviorEpisodePreencoder(
+        encoder=encoder,
+        device=device,
+        dtype=dtype,
+        temporal_patch_size=encoder.temporal_patch_size,
+    )
+    print(f"temporal_patch_size={encoder.temporal_patch_size} (from model config or config fallback)")
     max_workers = max(1, ((os.cpu_count() or 1) - 1))
     configured_workers = data_cfg.get("num_workers", 4)
     num_workers = min(configured_workers, max_workers)

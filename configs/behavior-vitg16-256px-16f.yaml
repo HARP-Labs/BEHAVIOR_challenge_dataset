@@ -3,6 +3,7 @@ meta:
 
 model:
   hf_repo: facebook/vjepa2-vitg-fpc64-256
+  temporal_patch_size: 2  # tubelet size; auto-detected from model config, this is the fallback
 
 data:
   datasets:
