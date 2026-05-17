@@ -428,6 +428,26 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
 
             actions.append(action_chunk.reshape(fstp * self.action_dim))
 
+        # One extra action chunk beyond the clip end.
+        # Future-action alignment: row t stores actions starting from the tubelet-t
+        # boundary (= last sampled frame of t), so we need fpc+1 chunks total.
+        # _accumulate will group them as [a1,a2],[a3,a4],... (shift by 1 sampled frame).
+        extra_start = int(window_indices[-1]) + fstp
+        if extra_start >= max_len:
+            actions.append(np.zeros(fstp * self.action_dim, dtype=np.float32))
+        else:
+            extra_end = min(extra_start + fstp, max_len)
+            extra_chunk = raw_actions[extra_start:extra_end]
+            if len(extra_chunk) == 0:
+                extra_chunk = np.zeros((fstp, self.action_dim), dtype=np.float32)
+            elif len(extra_chunk) < fstp:
+                extra_chunk = np.concatenate(
+                    [extra_chunk, np.repeat(extra_chunk[-1:], fstp - len(extra_chunk), axis=0)]
+                )
+            else:
+                extra_chunk = extra_chunk[:fstp]
+            actions.append(extra_chunk.reshape(fstp * self.action_dim))
+
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
         cam_rel_poses = np.asarray(cam_rel_poses, dtype=np.float32)
@@ -699,7 +719,7 @@ class BehaviorEpisodePreencoder:
             return "gpu=n/a"
 
     _MDS_COLUMNS_BASE = {
-        "actions":       "ndarray",  # (tps * fstp * action_dim,) — all native-fps actions within tubelet span
+        "actions":       "ndarray",  # (tps * fstp * action_dim,) — future actions from tubelet boundary onward
         "states":        "ndarray",  # (state_dim,)  — last sampled frame of tubelet (boundary state)
         "cam_rel_poses": "ndarray",  # (21,) — 3 cameras × (pos[3] + quat[4]), last frame of tubelet
         "frame_index":   "int",      # source video frame index at tubelet start
@@ -964,12 +984,13 @@ class BehaviorEpisodePreencoder:
             state["active_buffer"] = empty_buffer
         for view in views:
             state["active_buffer"][f"tokens_{view}"].append(tokens_by_view[view][b, :valid_steps])
-        # Actions: concatenate all tps sampled frames within each tubelet so that
-        # each stored row covers the full temporal span of its tubelet.
-        # Shape: (fpc, fstp*action_dim) → (num_steps, tps*fstp*action_dim)
-        act = batch["actions"][b]
-        num_steps = act.shape[0] // tps
-        act = act[: num_steps * tps].reshape(num_steps, tps * act.shape[-1])
+        # Future actions: batch["actions"] has fpc+1 chunks [a0..a_fpc].
+        # Shift by 1 sampled frame so row t stores actions executed FROM the
+        # tubelet-t boundary onward (causally aligned with the stored state).
+        # Groups: [a1,a2],[a3,a4],... → (num_steps, tps*fstp*action_dim)
+        act = batch["actions"][b]  # (fpc+1, fstp*action_dim)
+        num_steps = (act.shape[0] - 1) // tps  # = fpc // tps
+        act = act[1:1 + num_steps * tps].reshape(num_steps, tps * act.shape[-1])
         state["active_buffer"]["actions"].append(act[:valid_steps])
         # States and cam_rel_poses: snapshot at the last sampled frame of each tubelet
         # (boundary state — the robot state right at the edge between tubelet t and t+1,
