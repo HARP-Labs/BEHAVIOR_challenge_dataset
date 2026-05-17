@@ -302,10 +302,11 @@ class BaseDataset:
             if episode_rel:
                 files_to_download.append((task_root / "meta", str(episode_rel), "meta"))
 
-            for video_rel in episode.get("video_files", []):
-                # Extract short view name from remote path, e.g.
-                # "videos/observation.images.rgb.head/chunk-000/episode_000000.mp4" → "head"
-                view_key = Path(video_rel).parent.parent.name.split(".")[-1]
+            if self.camera_view_type == "multi":
+                view_names = ["head", "left_wrist", "right_wrist"]
+            else:
+                view_names = ["head"]
+            for view_key, video_rel in zip(view_names, episode.get("video_files", [])):
                 files_to_download.append((task_root / "video" / view_key, str(video_rel), "video"))
         return files_to_download
 
