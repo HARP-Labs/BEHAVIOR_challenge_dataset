@@ -435,26 +435,6 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
 
             actions.append(action_chunk.reshape(fstp * self.action_dim))
 
-        # One extra action chunk beyond the clip end.
-        # Future-action alignment: row t stores actions starting from the tubelet-t
-        # boundary (= last sampled frame of t), so we need fpc+1 chunks total.
-        # _accumulate will group them as [a1,a2],[a3,a4],... (shift by 1 sampled frame).
-        extra_start = int(window_indices[-1]) + fstp
-        if extra_start >= max_len:
-            actions.append(np.zeros(fstp * self.action_dim, dtype=np.float32))
-        else:
-            extra_end = min(extra_start + fstp, max_len)
-            extra_chunk = raw_actions[extra_start:extra_end]
-            if len(extra_chunk) == 0:
-                extra_chunk = np.zeros((fstp, self.action_dim), dtype=np.float32)
-            elif len(extra_chunk) < fstp:
-                extra_chunk = np.concatenate(
-                    [extra_chunk, np.repeat(extra_chunk[-1:], fstp - len(extra_chunk), axis=0)]
-                )
-            else:
-                extra_chunk = extra_chunk[:fstp]
-            actions.append(extra_chunk.reshape(fstp * self.action_dim))
-
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
         cam_rel_poses = np.asarray(cam_rel_poses, dtype=np.float32)
@@ -733,9 +713,9 @@ class BehaviorEpisodePreencoder:
             return "gpu=n/a"
 
     _MDS_COLUMNS_BASE = {
-        "actions":       "ndarray",  # (tps * fstp * action_dim,) — future actions from tubelet boundary onward
-        "states":        "ndarray",  # (state_dim,)  — last sampled frame of tubelet (boundary state)
-        "cam_rel_poses": "ndarray",  # (21,) — 3 cameras × (pos[3] + quat[4]), last frame of tubelet
+        "actions":       "ndarray",  # (fstp * action_dim,) — raw actions from frame f to frame f+1
+        "states":        "ndarray",  # (state_dim,) — robot state at frame f
+        "cam_rel_poses": "ndarray",  # (21,) — 3 cameras × (pos[3] + quat[4]) at frame f
         "frame_index":   "int",      # source video frame index at tubelet start
         "episode_idx":   "int",
         "sample_idx":    "int",
@@ -924,42 +904,39 @@ class BehaviorEpisodePreencoder:
         )
 
     def _encode_batch(self, video, fpc, temporal_patch_size):
-        """Encode a batch of video clips and reshape tokens per tubelet step.
+        """Encode a batch of video clips producing per-frame tokens.
 
-        The encoder's 3-D tubelet patch embedding groups ``temporal_patch_size``
-        consecutive frames into one token sequence.  With ``fpc`` input frames
-        the encoder produces ``num_steps = fpc // temporal_patch_size`` temporal
-        steps, each containing ``tokens_per_step = total_tokens / num_steps``
-        spatial patch tokens.
+        Each frame is encoded independently by duplicating it into a fake
+        ``temporal_patch_size``-frame tubelet (matching the approach used in
+        DROID/V-JEPA2 training).  This yields ``fpc`` token sets — one per
+        frame — rather than ``fpc // temporal_patch_size`` per genuine tubelet.
 
         Args:
             video: Raw video array of shape ``(B, T, H, W, C)`` or any layout
                 accepted by ``_to_video_tensor``.
-            fpc: Frames per clip fed to the encoder.
-            temporal_patch_size: Number of frames per tubelet (e.g. 2 for
-                V-JEPA2).  Must evenly divide ``fpc``.
+            fpc: Frames per clip (= number of per-frame token sets produced).
+            temporal_patch_size: Number of frames the encoder expects per
+                tubelet (e.g. 2 for V-JEPA2).  Each frame is repeated this
+                many times before being passed to the encoder.
 
         Returns:
             ``float32`` (or ``float16``) numpy array of shape
-            ``(B, num_steps, tokens_per_step, embed_dim)`` where
-            ``num_steps = fpc // temporal_patch_size``.
-
-        Raises:
-            AssertionError: If total encoder tokens are not divisible by
-                ``num_steps``.
+            ``(B, fpc, tokens_per_frame, embed_dim)``.
         """
-        tokens = self.encoder(self._to_video_tensor(video))
+        v = self._to_video_tensor(video)  # [B, C, T, H, W]
+        B, C, T, H, W = v.shape
+        # Encode each frame independently: flatten batch and time, duplicate
+        # each frame to satisfy the encoder's tubelet_size expectation.
+        v = v.permute(0, 2, 1, 3, 4).reshape(B * T, C, 1, H, W)  # [B*T, C, 1, H, W]
+        v = v.expand(-1, -1, temporal_patch_size, -1, -1)          # [B*T, C, tps, H, W]
+        tokens = self.encoder(v)
         if isinstance(tokens, (tuple, list)):
             tokens = tokens[0]
         storage_dtype = torch.float16 if self.dtype == torch.bfloat16 else self.dtype
         tokens = tokens.detach().cpu().to(storage_dtype).numpy()
-        num_steps = fpc // temporal_patch_size
-        assert tokens.shape[1] % num_steps == 0, (
-            f"Encoder output tokens ({tokens.shape[1]}) not divisible by "
-            f"num_steps ({num_steps}) = fpc ({fpc}) // temporal_patch_size ({temporal_patch_size})"
-        )
-        tokens_per_step = tokens.shape[1] // num_steps
-        return tokens.reshape(tokens.shape[0], num_steps, tokens_per_step, tokens.shape[2])
+        # tokens shape: [B*T, tokens_per_frame, embed_dim]
+        tokens_per_frame = tokens.shape[1]
+        return tokens.reshape(B, T, tokens_per_frame, tokens.shape[2])
 
     def _accumulate(self, state, dataset, writer, tokens_by_view, batch, b):
         """Accumulate encoded windows into the active episode buffer.
@@ -984,9 +961,8 @@ class BehaviorEpisodePreencoder:
         """
         episode_idx = int(batch["episode_idx"][b])
         valid_len   = int(batch["valid_len"][b])
-        tps = self.temporal_patch_size
-        # Round up: a tubelet is valid if its first frame is valid.
-        valid_steps = (valid_len + tps - 1) // tps
+        # Steps are now per-frame (tokens are per-frame after duplication encoding).
+        valid_steps = valid_len
         views = list(tokens_by_view.keys())
         empty_buffer = {f"tokens_{view}": [] for view in views} | {"actions": [], "states": [], "cam_rel_poses": [], "frame_indices": [], "starts": []}
         if state["active_episode_idx"] is None:
@@ -998,18 +974,14 @@ class BehaviorEpisodePreencoder:
             state["active_buffer"] = empty_buffer
         for view in views:
             state["active_buffer"][f"tokens_{view}"].append(tokens_by_view[view][b, :valid_steps])
-        # Future actions: batch["actions"] has fpc+1 chunks [a0..a_fpc].
-        # Shift by 1 sampled frame so row t stores actions executed FROM the
-        # tubelet-t boundary onward (causally aligned with the stored state).
-        # Groups: [a1,a2],[a3,a4],... → (num_steps, tps*fstp*action_dim)
+        # Actions: one chunk per frame — the fstp raw actions executed FROM frame f
+        # onward (i.e. what the robot does between observation f and f+1).
+        # batch["actions"] has shape (fpc+1, fstp*action_dim); take only fpc frames.
         act = batch["actions"][b]  # (fpc+1, fstp*action_dim)
-        num_steps = (act.shape[0] - 1) // tps  # = fpc // tps
-        act = act[1:1 + num_steps * tps].reshape(num_steps, tps * act.shape[-1])
         state["active_buffer"]["actions"].append(act[:valid_steps])
-        # States and cam_rel_poses: snapshot at the last sampled frame of each tubelet
-        # (boundary state — the robot state right at the edge between tubelet t and t+1,
-        # which is the most informative conditioning for predicting tubelet t+1 tokens).
-        state["active_buffer"]["states"].append(batch["states"][b, 1::tps][:valid_steps])
-        state["active_buffer"]["cam_rel_poses"].append(batch["cam_rel_poses"][b, 1::tps][:valid_steps])
-        state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, ::tps][:valid_steps])
+        # States and cam_rel_poses: snapshot AT the frame index (start of each step),
+        # matching the moment each frame's tokens were observed.
+        state["active_buffer"]["states"].append(batch["states"][b, :valid_steps])
+        state["active_buffer"]["cam_rel_poses"].append(batch["cam_rel_poses"][b, :valid_steps])
+        state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_steps])
         state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
