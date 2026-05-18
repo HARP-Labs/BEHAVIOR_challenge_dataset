@@ -518,6 +518,7 @@ class _ShardUploader:
         # Suppress per-file upload progress bars and verbose HF hub logging.
         try:
             import huggingface_hub.utils as _hf_utils
+            _hf_utils.disable_progress_bars()       # suppresses tqdm transfer bars
             _hf_utils.logging.disable_progress_bars()
             _hf_utils.logging.set_verbosity_error()
         except Exception:
