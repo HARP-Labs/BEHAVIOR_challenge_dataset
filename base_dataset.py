@@ -191,7 +191,7 @@ class BaseDataset:
         self.logger.info(f"Saved selected metadata to {metadata_file.resolve()}")
         self._download_selected_episodes(selected_meta)
         return selected_meta
-     
+    
     def _download_selected_episodes(self, selected_meta: dict[str, Any]) -> None:
         """
         Download all files referenced by the selected manifest and store them
