@@ -478,7 +478,6 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self._video_reader_cache[vpath] = vr
         return vr
 
-#TODO
 class _ShardUploader:
     """Uploads completed MDS shards to HF in a background thread.
 
