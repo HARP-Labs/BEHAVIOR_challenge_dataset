@@ -43,20 +43,19 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
     # Curated proprioceptive state slices (indices into the 256-dim observation.state vector).
     # Excludes simulator-only global state (base odometry, robot_pos, global orientation)
     # and redundant arm sub-slices already covered by joint_qpos[6:28].
-    # Layout reference: R1Pro BEHAVIOR-2025 state vector documentation.
+    # Layout reference: https://github.com/StanfordVL/BEHAVIOR-1K/blob/main/OmniGibson/omnigibson/learning/utils/eval_utils.py
     PROPRIO_SLICES = [
         np.s_[6:28],    # joint_qpos: controllable joints only (torso+arms+grippers, no base odometry)
         np.s_[34:56],   # joint_qpos_sin: controllable joints
         np.s_[62:84],   # joint_qpos_cos: controllable joints
         np.s_[84:112],  # joint_qvel: all joints (velocity is encoder-based, not odometric)
-        np.s_[112:140], # joint_qeffort: all joints (encodes contact events at grasp/collision)
         np.s_[152:158], # robot_lin_vel + robot_ang_vel (IMU-observable on real robot)
         np.s_[186:197], # eef_left_pos[3] + eef_left_quat[4] + gripper_left_qpos[2] + gripper_left_qvel[2]
         np.s_[225:244], # eef_right_pos[3] + eef_right_quat[4] + gripper_right_qpos[2] + gripper_right_qvel[2]
                         # + trunk_qpos[4] + trunk_qvel[4]
         np.s_[253:256], # base_qvel (encoder velocity, not accumulated position)
     ]
-    PROPRIO_DIM: int = 161  # sum of all PROPRIO_SLICES sizes
+    PROPRIO_DIM: int = 133  # sum of all PROPRIO_SLICES sizes
 
     @staticmethod
     def _extract_proprio(full_states: np.ndarray) -> np.ndarray:
@@ -77,10 +76,10 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         data_path,
-        fpcs=16,
+        fpcs=8,
         fps=5,
         transform=None,
-        camera_view="head",
+        camera_view="multi",
         action_dim=23,
         cache_parquet=False,
         cache_video_readers=False,
@@ -287,7 +286,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         """Return the sample dict for a given window index.
 
-        Retries up to 10 times with a randomly selected fallback window when
+        Retries up to 10 times when
         loading fails, then re-raises on the final attempt.
 
         Args:
@@ -305,7 +304,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         episode_idx, start_idx = self.windows[index]
         plan = self.episode_plans[episode_idx]
         sample = self.samples[plan["sample_idx"]]
-        max_retries = 10
+        max_retries = 1
         for attempt in range(max_retries):
             try:
                 buffers, actions, states, cam_rel_poses, indices = self.loadvideo_decord(sample, plan, start_idx=start_idx)
@@ -314,9 +313,6 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 logger.warning(f"Attempt {attempt+1}/{max_retries} failed for sample={sample} {e=}")
                 if attempt == max_retries - 1:
                     raise
-                episode_idx, start_idx = self.windows[np.random.randint(self.__len__())]
-                plan = self.episode_plans[episode_idx]
-                sample = self.samples[plan["sample_idx"]]
 
         valid_len = min(self.fpc, len(plan["indices"]) - start_idx)
         return {
@@ -369,8 +365,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             raise ValueError(f"Expected `observation.state` and `action` in parquet: {ppath}")
         full_states = np.asarray(df["observation.state"].to_list(), dtype=np.float32)
         full_actions = np.asarray(df["action"].to_list(), dtype=np.float32)
-        # cam_rel_poses: 21-dim (3 cameras × position[3] + quaternion[4]).
-        # Zeroed out gracefully when the column is absent.
+        # cam_rel_poses: 21-dim (3 cameras × position[3] + quaternion[4]). Zeroed out gracefully when the column is absent.
         if "observation.cam_rel_poses" in df.columns:
             full_cam_rel_poses = np.asarray(df["observation.cam_rel_poses"].to_list(), dtype=np.float32)
         else:
