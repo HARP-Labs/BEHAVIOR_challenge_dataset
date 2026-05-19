@@ -304,7 +304,14 @@ class BaseDataset:
                 view_names = ["head", "left_wrist", "right_wrist"]
             else:
                 view_names = ["head"]
-            for view_key, video_rel in zip(view_names, episode.get("video_files", [])):
+            vfiles = episode.get("video_files", [])
+            if len(vfiles) < len(view_names):
+                logger.warning(
+                    f"episode {episode.get('episode_index')}: expected {len(view_names)} video files "
+                    f"for camera_view_type={self.camera_view_type!r}, got {len(vfiles)} — "
+                    "some camera views will be missing"
+                )
+            for view_key, video_rel in zip(view_names, vfiles):
                 files_to_download.append((task_root / "video" / view_key, str(video_rel), "video"))
         return files_to_download
 
@@ -466,8 +473,7 @@ class BaseDataset:
         ]
 
         # Sanitize task_name to match the directory created by _build_download_targets.
-        import re as _re
-        safe_task_name = _re.sub(r"[^a-zA-Z0-9._-]+", "_", task_name or "unknown_task").strip("_") or "unknown_task"
+        safe_task_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", task_name or "unknown_task").strip("_") or "unknown_task"
         return {
             "task": task_desc,
             "task_name": safe_task_name,

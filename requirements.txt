@@ -9,3 +9,4 @@ decord
 pyyaml
 transformers
 zstd
+opencv-python

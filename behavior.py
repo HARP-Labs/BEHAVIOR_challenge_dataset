@@ -59,14 +59,14 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def _extract_proprio(full_states: np.ndarray) -> np.ndarray:
-        """Extract the curated 161-dim proprioceptive vector from the full 256-dim state.
+        """Extract the curated 133-dim proprioceptive vector from the full 256-dim state.
 
         Args:
             full_states: Float32 array of shape ``(T, 256)`` containing the raw
                 ``observation.state`` values for an episode.
 
         Returns:
-            Float32 array of shape ``(T, 161)`` with simulator-only and redundant
+            Float32 array of shape ``(T, 133)`` with simulator-only and redundant
             dimensions removed.
         """
         return np.concatenate(
@@ -110,7 +110,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.camera_view = camera_view
         self.views = self.CAMERA_VIEWS[camera_view]
-        self.state_dim = self.PROPRIO_DIM  # fixed 161-dim curated proprioceptive vector
+        self.state_dim = self.PROPRIO_DIM  # fixed 133-dim curated proprioceptive vector
         self.action_dim = action_dim
         self.cache_parquet = cache_parquet
         self.cache_video_readers = cache_video_readers
@@ -286,8 +286,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         """Return the sample dict for a given window index.
 
-        Retries up to 10 times when
-        loading fails, then re-raises on the final attempt.
+        Tries once; re-raises immediately on failure.
 
         Args:
             index: Integer index into ``self.windows``.
@@ -935,10 +934,11 @@ class BehaviorEpisodePreencoder:
     def _accumulate(self, state, dataset, writer, tokens_by_view, batch, b):
         """Accumulate encoded windows into the active episode buffer.
 
-        ``tokens`` are already in tubelet-step space
-        ``(B, num_steps, tokens_per_step, embed_dim)``.  Actions, states, and
-        frame indices are downsampled from frame space to step space by taking
-        the first frame of each tubelet (stride ``temporal_patch_size``).
+        Each frame in the clip window becomes one MDS row.  ``tokens_by_view``
+        contains per-frame token arrays of shape ``(B, fpc, tokens_per_frame,
+        embed_dim)`` as returned by ``_encode_batch``.  Actions, states, and
+        frame indices are stored one entry per sampled frame (``valid_len``
+        entries per clip, trimming end-of-episode padding).
 
         When the episode index changes, the previous episode is flushed to the
         MDS writer before starting a new buffer.
@@ -948,8 +948,8 @@ class BehaviorEpisodePreencoder:
             dataset: The source ``BehaviorVideoDataset``.
             writer: Open ``MDSWriter`` instance.
             tokens_by_view: Dict mapping view name to encoded token array of
-                shape ``(B, num_steps, tokens_per_step, embed_dim)`` as
-                returned by ``_encode_batch``.
+                shape ``(B, fpc, tokens_per_frame, embed_dim)`` as returned by
+                ``_encode_batch``.
             batch: Collated batch dict from the data loader.
             b: Batch index of the sample to accumulate.
         """

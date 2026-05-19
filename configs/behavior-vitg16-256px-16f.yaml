@@ -18,7 +18,7 @@ data:
   prefetch_factor: 4
   pin_mem: true
   camera_view: multi  # "head" or "multi" (head + left_wrist + right_wrist)
-  # state_dim is fixed at 161 by BehaviorVideoDataset.PROPRIO_SLICES — not configurable here
+  # state_dim is fixed at 133 by BehaviorVideoDataset.PROPRIO_SLICES — not configurable here
   action_dim: 23
   cache_parquet: false
   cache_video_readers: false
