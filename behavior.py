@@ -346,8 +346,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             Tuple of ``(buffers, actions, states, cam_rel_poses, window_indices)``
             where ``buffers`` is a dict keyed by view name, each value a ``uint8``
             ndarray of shape ``(fpc, H, W, C)``.  ``actions`` is a ``float32``
-            ndarray of shape ``(fpc+1, fstp*action_dim)`` — one extra chunk beyond
-            the clip for future-action alignment.  ``states`` and ``cam_rel_poses``
+            ndarray of shape ``(fpc, fstp*action_dim)`` — one chunk per frame.  ``states`` and ``cam_rel_poses``
             are ``float32`` ndarrays of shape ``(fpc, state_dim)`` and
             ``(fpc, 21)`` respectively.  ``window_indices`` is an ``int64``
             ndarray of the actual video frame positions.
@@ -480,7 +479,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self._video_reader_cache[vpath] = vr
         return vr
 
-
+#TODO
 class _ShardUploader:
     """Uploads completed MDS shards to HF in a background thread.
 
@@ -510,10 +509,9 @@ class _ShardUploader:
         self._repo_id      = repo_id
         self._path_in_repo = path_in_repo
         self._delete_local = delete_local
-        # Suppress per-file upload progress bars and verbose HF hub logging.
         try:
             import huggingface_hub.utils as _hf_utils
-            _hf_utils.disable_progress_bars()       # suppresses tqdm transfer bars
+            _hf_utils.disable_progress_bars()
             _hf_utils.logging.disable_progress_bars()
             _hf_utils.logging.set_verbosity_error()
         except Exception:
@@ -595,7 +593,7 @@ class _ShardUploader:
 class BehaviorEpisodePreencoder:
     """Run a vision encoder on BEHAVIOR clips and save pre-encoded episode shards."""
 
-    def __init__(self, encoder, device=None, dtype=torch.float32, temporal_patch_size: int = 2):
+    def __init__(self, encoder, device=None, dtype=torch.float32, temporal_patch_size: int = 2):  # temporal_path_size = tubulet size in frames
         """Initialize the pre-encoder and move the encoder model to the target device.
 
         Args:
@@ -712,7 +710,7 @@ class BehaviorEpisodePreencoder:
         "actions":       "ndarray",  # (fstp * action_dim,) — raw actions from frame f to frame f+1
         "states":        "ndarray",  # (state_dim,) — robot state at frame f
         "cam_rel_poses": "ndarray",  # (21,) — 3 cameras × (pos[3] + quat[4]) at frame f
-        "frame_index":   "int",      # source video frame index at tubelet start
+        "frame_index":   "int",      # source video frame index
         "episode_idx":   "int",
         "sample_idx":    "int",
         "step_pos":      "int",      # tubelet position within episode (0-indexed)
@@ -730,7 +728,7 @@ class BehaviorEpisodePreencoder:
         return {**token_cols, **BehaviorEpisodePreencoder._MDS_COLUMNS_BASE}
 
     @torch.inference_mode()
-    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=8, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2):
+    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4):
         """Encode all episodes and write them as MDS shards.
 
         Iterates over ``dataset`` in window order, encodes each batch with the
@@ -807,7 +805,7 @@ class BehaviorEpisodePreencoder:
                     if batch_idx % 10 == 0:
                         pbar.set_postfix_str(self._gpu_status())
                     tokens_by_view = {
-                        view: self._encode_batch(batch["video"][view], dataset.fpc, self.temporal_patch_size)
+                        view: self._encode_batch(batch["video"][view],self.temporal_patch_size)
                         for view in views
                     }
                     batch_size = next(iter(tokens_by_view.values())).shape[0]
@@ -899,7 +897,7 @@ class BehaviorEpisodePreencoder:
             collate_fn=self.behavior_preencode_collate,
         )
 
-    def _encode_batch(self, video, fpc, temporal_patch_size):
+    def _encode_batch(self, video,temporal_patch_size):
         """Encode a batch of video clips producing per-frame tokens.
 
         Each frame is encoded independently by duplicating it into a fake
@@ -924,7 +922,7 @@ class BehaviorEpisodePreencoder:
         # Encode each frame independently: flatten batch and time, duplicate
         # each frame to satisfy the encoder's tubelet_size expectation.
         v = v.permute(0, 2, 1, 3, 4).reshape(B * T, C, 1, H, W)  # [B*T, C, 1, H, W]
-        v = v.expand(-1, -1, temporal_patch_size, -1, -1)          # [B*T, C, tps, H, W]
+        v = v.expand(-1, -1, temporal_patch_size, -1, -1).contiguous() # [B*T, C, tps, H, W]
         tokens = self.encoder(v)
         if isinstance(tokens, (tuple, list)):
             tokens = tokens[0]
@@ -957,8 +955,6 @@ class BehaviorEpisodePreencoder:
         """
         episode_idx = int(batch["episode_idx"][b])
         valid_len   = int(batch["valid_len"][b])
-        # Steps are now per-frame (tokens are per-frame after duplication encoding).
-        valid_steps = valid_len
         views = list(tokens_by_view.keys())
         empty_buffer = {f"tokens_{view}": [] for view in views} | {"actions": [], "states": [], "cam_rel_poses": [], "frame_indices": [], "starts": []}
         if state["active_episode_idx"] is None:
@@ -969,15 +965,15 @@ class BehaviorEpisodePreencoder:
             state["active_episode_idx"] = episode_idx
             state["active_buffer"] = empty_buffer
         for view in views:
-            state["active_buffer"][f"tokens_{view}"].append(tokens_by_view[view][b, :valid_steps])
+            state["active_buffer"][f"tokens_{view}"].append(tokens_by_view[view][b, :valid_len])
         # Actions: one chunk per frame — the fstp raw actions executed FROM frame f
         # onward (i.e. what the robot does between observation f and f+1).
-        # batch["actions"] has shape (fpc+1, fstp*action_dim); take only fpc frames.
-        act = batch["actions"][b]  # (fpc+1, fstp*action_dim)
-        state["active_buffer"]["actions"].append(act[:valid_steps])
+        # batch["actions"] has shape (fpc, fstp*action_dim); valid_len trims end-of-episode padding.
+        act = batch["actions"][b]  # (fpc, fstp*action_dim)
+        state["active_buffer"]["actions"].append(act[:valid_len])
         # States and cam_rel_poses: snapshot AT the frame index (start of each step),
         # matching the moment each frame's tokens were observed.
-        state["active_buffer"]["states"].append(batch["states"][b, :valid_steps])
-        state["active_buffer"]["cam_rel_poses"].append(batch["cam_rel_poses"][b, :valid_steps])
-        state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_steps])
+        state["active_buffer"]["states"].append(batch["states"][b, :valid_len])
+        state["active_buffer"]["cam_rel_poses"].append(batch["cam_rel_poses"][b, :valid_len])
+        state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_len])
         state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
