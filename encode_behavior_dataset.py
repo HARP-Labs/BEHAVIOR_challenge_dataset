@@ -4,7 +4,7 @@ import argparse
 import os
 import torch
 import yaml
-from transformers import AutoModel, AutoVideoProcessor
+from transformers import AutoModel
 from vjepa2_BEHAVIOR.app.vjepa_droid.transforms import make_transforms
 from behavior import BehaviorEpisodePreencoder, BehaviorVideoDataset
 
@@ -22,7 +22,6 @@ class HFVJEPA2Encoder(torch.nn.Module):
         """
         super().__init__()
         self.model = AutoModel.from_pretrained(hf_repo_id)
-        self.processor = AutoVideoProcessor.from_pretrained(hf_repo_id)
         self._temporal_patch_size_fallback = temporal_patch_size
 
     @property
