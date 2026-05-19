@@ -889,7 +889,7 @@ class BehaviorEpisodePreencoder:
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=False,
+            shuffle=False, # hast to be False to maintain episode order for accumulation
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=(persistent_workers and num_workers > 0),
