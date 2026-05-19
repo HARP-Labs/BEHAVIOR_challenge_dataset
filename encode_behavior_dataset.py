@@ -17,7 +17,9 @@ class NativeVJEPA21Encoder(torch.nn.Module):
         super().__init__()
         backbones = importlib.import_module("vjepa2_BEHAVIOR.src.hub.backbones")
         backbone_fn = getattr(backbones, model_name)
-        self.encoder, _ = backbone_fn(pretrained=True, tubelet_size=tubelet_size)
+        encoder, predictor = backbone_fn(pretrained=True, tubelet_size=tubelet_size)
+        self.encoder = encoder
+        del predictor
         self.temporal_patch_size = tubelet_size
 
     def forward(self, video):
