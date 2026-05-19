@@ -509,9 +509,9 @@ class _ShardUploader:
         self._delete_local = delete_local
         try:
             import huggingface_hub.utils as _hf_utils
-            _hf_utils.disable_progress_bars()
-            _hf_utils.logging.disable_progress_bars()
-            _hf_utils.logging.set_verbosity_error()
+            import huggingface_hub.utils.logging as _hf_logging
+            _hf_utils.disable_progress_bars()  # pyright: ignore[reportPrivateImportUsage]
+            _hf_logging.set_verbosity_error()
         except Exception:
             pass
         self._uploaded     = set()
