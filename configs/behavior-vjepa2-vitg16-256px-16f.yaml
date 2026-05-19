@@ -2,6 +2,7 @@ meta:
   dtype: bfloat16
 
 model:
+  backend: hf
   hf_repo: facebook/vjepa2-vitg-fpc64-256  # swap to any HF vjepa2 repo here
   temporal_patch_size: 2  # tubelet size; auto-detected from model config, this is the fallback
 

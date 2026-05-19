@@ -1,0 +1,42 @@
+meta:
+  dtype: bfloat16
+
+model:
+  backend: native_vjepa21
+  model_name: vjepa2_1_vit_giant_384  # options: vjepa2_1_vit_base_384, vjepa2_1_vit_large_384, vjepa2_1_vit_giant_384, vjepa2_1_vit_gigantic_384
+  temporal_patch_size: 2
+
+data:
+  datasets:
+    - /content/base_dataset/manifest.json
+  dataset_fpcs:
+    - 8
+  batch_size: 1
+  fps: 5
+  crop_size: 384
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_mem: true
+  camera_view: multi  # "head" or "multi" (head + left_wrist + right_wrist)
+  action_dim: 23
+  cache_parquet: false
+  cache_video_readers: false
+
+data_aug:
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+    - 0.75
+    - 1.35
+  random_resize_scale:
+    - 1.777
+    - 1.777
+  reprob: 0.0
+
+output:
+  local_output_dir:
+  hf_repo_id:  quastAI/behavior2025-vjepa2-vitg-130h-demo-embeddings
+  hf_path_prefix: shards_384px_vjepa21_vit_16_g
+  max_shard_bytes: 1073741824  # 1 GiB
