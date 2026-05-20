@@ -144,3 +144,36 @@ Simulator-only global state (absolute position, accumulated odometry) is exclude
 ## License
 
 See [LICENSE](LICENSE).
+
+## Citations
+
+If you use this pipeline or the associated work, please cite:
+
+```bibtex
+@misc{Quast2026,
+  title={Short Horizon Planning with V-JEPA-2 AC on BEHAVIOR-1K},
+  author={Quast, Julian},
+  year={2026},
+}
+
+@article{Assran2025VJEPA2,
+  title={V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning},
+  author={Assran, Mido and Bardes, Adrien and Fan, David and Garrido, Quentin and Howes, Russell and Komeili, Mojtaba and Muckley, Matthew and Rizvi, Ammar and Roberts, Claire and Sinha, Koustuv and Zholus, Artem and Arnaud, Sergio and Gejji, Abha and Martin, Ada and Hogan, Francois Robert and Dugas, Daniel and Bojanowski, Piotr and Khalidov, Vasil and Labatut, Patrick and Massa, Francisco and Szafraniec, Marc and Krishnakumar, Kapil and Li, Yong and Ma, Xiaodong and Chandar, Sarath and Meier, Franziska and LeCun, Yann and Rabbat, Michael and Ballas, Nicolas},
+  journal={arXiv preprint arXiv:2506.09985},
+  year={2025},
+}
+
+@article{MurLabadia2026VJEPA21,
+  title={V-JEPA 2.1: Unlocking Dense Features in Video Self-Supervised Learning},
+  author={Mur-Labadia, Lorenzo and Muckley, Matthew and Bar, Amir and Assran, Mido and Sinha, Koustuv and Rabbat, Mike and LeCun, Yann and Ballas, Nicolas and Bardes, Adrien},
+  journal={arXiv preprint arXiv:2603.14482},
+  year={2026},
+}
+
+@inproceedings{Li2022BEHAVIOR1K,
+  title={BEHAVIOR-1K: A Human-Centered, Embodied AI Benchmark with 1,000 Everyday Activities and Realistic Simulation},
+  author={Li, Chengshu and Zhang, Ruohan and Wong, Josiah and Gokmen, Cem and Srivastava, Sanjana and Mart{\'i}n-Mart{\'i}n, Roberto and Wang, Chen and Levine, Gabrael and Ai, Wensi and Martinez, Benjamin and others},
+  booktitle={6th Conference on Robot Learning (CoRL)},
+  year={2022},
+}
+```
