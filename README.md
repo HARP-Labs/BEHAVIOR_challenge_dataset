@@ -30,6 +30,7 @@ cd BEHAVIOR_challenge_dataset
 ```
 
 ```bash
+pip install -e ../vjepa2_BEHAVIOR
 pip install -r requirements.txt
 ```
 
