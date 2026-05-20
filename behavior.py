@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import random
 import threading
 import time
 from logging import getLogger
@@ -229,7 +230,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         # Use the first view's video to determine FPS and length.
         vpath = next(iter(sample["video_paths"].values()))
         ppath = sample["parquet_path"]
-        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+        vr = VideoReader(vpath, num_threads=1, ctx=cpu(0))
         try:
             vfps = vr.get_avg_fps()
             vlen = len(vr)
@@ -435,7 +436,6 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         buffers = {}
         for view, vpath in sample["video_paths"].items():
             vr = self._get_video_reader(vpath)
-            vr.seek(0)
             buf = vr.get_batch(window_indices).asnumpy()
             if self.transform is not None:
                 buf = self.transform(buf)
@@ -470,11 +470,11 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             ``decord.VideoReader`` instance for the requested file.
         """
         if not self.cache_video_readers:
-            return VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+            return VideoReader(vpath, num_threads=1, ctx=cpu(0))
         cached = self._video_reader_cache.get(vpath)
         if cached is not None:
             return cached
-        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+        vr = VideoReader(vpath, num_threads=1, ctx=cpu(0))
         self._video_reader_cache[vpath] = vr
         return vr
 
@@ -664,13 +664,15 @@ class BehaviorEpisodePreencoder:
                 ``BehaviorVideoDataset.__getitem__``.
 
         Returns:
-            Dict mapping each key to a stacked numpy array with an added
-            leading batch dimension.
+            Dict with ``video`` values as stacked ``torch.Tensor`` (enabling
+            pin_memory) and all other keys as stacked numpy arrays.
         """
+        def _as_tensor(x):
+            return x if isinstance(x, torch.Tensor) else torch.from_numpy(np.asarray(x))
         views = list(batch[0]["video"].keys())
         return {
             "video": {
-                view: np.stack([item["video"][view] for item in batch], axis=0)
+                view: torch.stack([_as_tensor(item["video"][view]) for item in batch])
                 for view in views
             },
             "actions": np.stack([item["actions"] for item in batch], axis=0),
@@ -776,6 +778,8 @@ class BehaviorEpisodePreencoder:
             write_dir = tmp_dir
 
         data_loader = self._make_data_loader(dataset, batch_size, num_workers, pin_memory, persistent_workers, prefetch_factor)
+        assert isinstance(data_loader.sampler, torch.utils.data.SequentialSampler), \
+            "DataLoader must use SequentialSampler (shuffle=False) — episode accumulation requires ordered windows"
         state = {
             "encoded_episodes": 0,
             "encoded_frames": 0,
@@ -868,6 +872,12 @@ class BehaviorEpisodePreencoder:
         state["active_episode_idx"] = None
         state["active_buffer"] = None
 
+    @staticmethod
+    def _worker_init_fn(_worker_id):
+        seed = torch.initial_seed() % (2**32)
+        np.random.seed(seed)
+        random.seed(seed)
+
     def _make_data_loader(self, dataset, batch_size, num_workers, pin_memory, persistent_workers, prefetch_factor):
         """Construct a non-shuffling DataLoader with the pre-encode collate function.
 
@@ -893,6 +903,7 @@ class BehaviorEpisodePreencoder:
             persistent_workers=(persistent_workers and num_workers > 0),
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             collate_fn=self.behavior_preencode_collate,
+            worker_init_fn=self._worker_init_fn if num_workers > 0 else None,
         )
 
     def _encode_batch(self, video,temporal_patch_size):
