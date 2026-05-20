@@ -9,14 +9,12 @@ HuggingFace BEHAVIOR-1K
         │
         ▼
 ┌───────────────────┐
-│  base_dataset.py  │  Sample episodes by task up to a time budget
-│                   │  → base_dataset/manifest.json + raw MP4/parquet
+│  base_dataset.py  │  Sample episodes by task up to a time budget → base_dataset/manifest.json +  raw MP4/parquet
 └────────┬──────────┘
          │
          ▼
 ┌────────────────────────────┐
-│  encode_behavior_dataset.py│  Encode frames with V-JEPA2
-│                            │  → MDS shards (tokens + actions + states)
+│  encode_behavior_dataset.py│  Encode frames with V-JEPA2 → MDS shards (tokens + actions + states)
 └────────┬───────────────────┘
          │
          ▼
@@ -27,14 +25,18 @@ HuggingFace BEHAVIOR-1K
 ## Setup
 
 ```bash
+cd ..
+git clone https://github.com/LOTO-H-JEPA/vjepa2_BEHAVIOR.git
+cd BEHAVIOR_challenge_dataset
+```
+
+```bash
 pip install -r requirements.txt
 ```
 
 A HuggingFace token with access to the BEHAVIOR-1K dataset is required:
 
 ```bash
-huggingface-cli login
-# or
 export HF_TOKEN=<your_token>
 ```
 
@@ -49,6 +51,8 @@ python base_dataset.py
 Reads `configs/base_dataset.yaml`, samples episodes up to the configured time budget, and writes raw files plus `base_dataset/manifest.json`.
 
 ### Step 2 — Encode with V-JEPA2
+
+Configure the config you are using for the correct output target (`config.output`). Either set `hf_repo_id` to stream shards directly to a HuggingFace dataset repo, or set `local_dir` to write shards to a local directory. Adjust `batch_size` and `fps_clips_per_second` to match your GPU memory and desired sampling rate.
 
 ```bash
 # V-JEPA2 (HuggingFace backend, 256px)
@@ -128,25 +132,6 @@ The 133-dim state vector is a curated subset of the raw 256-dim `observation.sta
 - `[253:256]` — base encoder velocity
 
 Simulator-only global state (absolute position, accumulated odometry) is excluded.
-
-## Running in Google Colab
-
-```python
-# 1) Clone repo
-!git clone <YOUR_REPO_URL>
-%cd BEHAVIOR_challenge_dataset
-
-# 2) Install deps
-!pip install -r requirements.txt
-
-# 3) Set HF token
-import os
-os.environ["HF_TOKEN"] = "<your_token>"
-
-# 4) Run pipeline
-!python base_dataset.py
-!python encode_behavior_dataset.py --fname configs/behavior-vjepa2-vitg16-256px-16f.yaml
-```
 
 ## Architecture
 
