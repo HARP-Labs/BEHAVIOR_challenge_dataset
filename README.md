@@ -98,18 +98,21 @@ Same structure as above but uses `model.backend: native_vjepa21` and `model.mode
 
 ## MDS Shard Schema
 
-Each shard row contains one fixed-length clip (8 frames) from one camera view:
+Each shard row corresponds to one timestep (one frame) and contains tokens for all camera views together:
 
 | Column | Type | Description |
 |---|---|---|
-| `tokens_head` | `bfloat16 [N, D]` | V-JEPA2 tubelets from head camera |
-| `tokens_left` | `bfloat16 [N, D]` | V-JEPA2 tubelets from left wrist |
-| `tokens_right` | `bfloat16 [N, D]` | V-JEPA2 tubelets from right wrist |
-| `actions` | `float32 [T, 23]` | Robot joint actions |
-| `states` | `float32 [T, 133]` | Proprioceptive state (133-dim curated subset) |
-| `cam_rel_poses` | `float32` | Camera relative poses |
-| `frame_index` | `int` | Start frame index within the episode |
+| `tokens_head` | `ndarray [tokens_per_frame, D]` | V-JEPA2 tokens for head camera at this frame |
+| `tokens_left` | `ndarray [tokens_per_frame, D]` | V-JEPA2 tokens for left wrist camera at this frame |
+| `tokens_right` | `ndarray [tokens_per_frame, D]` | V-JEPA2 tokens for right wrist camera at this frame |
+| `actions` | `ndarray [fstp * action_dim]` | Raw actions executed from this frame to the next |
+| `states` | `ndarray [133]` | Proprioceptive state at this frame (133-dim curated subset) |
+| `cam_rel_poses` | `ndarray [21]` | Camera poses at this frame (3 cameras × pos[3] + quat[4]) |
+| `frame_index` | `int` | Source video frame index within the episode |
 | `episode_idx` | `int` | Episode index |
+| `sample_idx` | `int` | Sample index within the dataset |
+| `step_pos` | `int` | Timestep position within the episode (0-indexed) |
+| `episode_len` | `int` | Total number of timesteps in this episode |
 
 ## Proprioceptive State (`PROPRIO_DIM = 133`)
 
