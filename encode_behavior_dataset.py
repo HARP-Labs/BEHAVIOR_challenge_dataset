@@ -88,7 +88,7 @@ def main(cfg_path: str):
     dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    encoder = _build_encoder(model_cfg).to(device)
+    encoder = _build_encoder(model_cfg).to(device=device, dtype=dtype)
     print(f"backend={model_cfg.get('backend', 'hf')}  temporal_patch_size={encoder.temporal_patch_size}")
 
     transform = make_transforms(
