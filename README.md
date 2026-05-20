@@ -18,8 +18,7 @@ HuggingFace BEHAVIOR-1K
 └────────┬───────────────────┘
          │
          ▼
-  HuggingFace MDS repo
-  (quastAI/behavior2025-...)
+  HuggingFace MDS repo/ local
 ```
 
 ## Setup
