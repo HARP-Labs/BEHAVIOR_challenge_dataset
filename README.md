@@ -62,7 +62,7 @@ python encode_behavior_dataset.py --fname configs/behavior-vjepa2-vitg16-256px-1
 python encode_behavior_dataset.py --fname configs/behavior-vjepa21-vitg16-384px-16f.yaml
 ```
 
-Encodes all episodes in the manifest and streams MDS shards to HuggingFace concurrently.
+Encodes all episodes in the manifest.
 
 ### Step 3 — Validate shards
 
