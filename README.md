@@ -1,20 +1,134 @@
-# BEHAVIOR_challange_dataset
+# BEHAVIOR Challenge Dataset Pipeline
 
-## Why you were seeing `data/data`, `meta/meta`, `video/videos` and `task-XXXX` folders
+A dataset pipeline for the [BEHAVIOR-1K](https://behavior.stanford.edu/) robot manipulation challenge. Downloads episodes from HuggingFace, samples a budget-constrained subset, encodes video frames with a V-JEPA2 vision transformer, and writes [MDS shards](https://docs.mosaicml.com/projects/streaming/en/stable/) for downstream training.
 
-The downloaded paths come from the source dataset templates in metadata (`data_path`, `metainfo_path`, `video_path`). Those remote paths already include nested segments such as `data/task-0033/...` and `videos/task-0033/...`. When we were passing a local destination folder (e.g., `<task>/data`) directly into `hf_hub_download`, Hugging Face preserved the remote path under that destination, which produced structures like:
+## Pipeline Overview
 
-- `<task>/data/data/task-0033/...`
-- `<task>/meta/meta/episodes/task-0033/...`
-- `<task>/video/videos/task-0033/...`
+```
+HuggingFace BEHAVIOR-1K
+        │
+        ▼
+┌───────────────────┐
+│  base_dataset.py  │  Sample episodes by task up to a time budget
+│                   │  → base_dataset/manifest.json + raw MP4/parquet
+└────────┬──────────┘
+         │
+         ▼
+┌────────────────────────────┐
+│  encode_behavior_dataset.py│  Encode frames with V-JEPA2
+│                            │  → MDS shards (tokens + actions + states)
+└────────┬───────────────────┘
+         │
+         ▼
+  HuggingFace MDS repo
+  (quastAI/behavior2025-...)
+```
 
-The downloader now flattens each file into the intended local folder (`data`, `meta`, `video`) by copying only the downloaded filename into that folder.
-
-## Run the pipeline in Google Colab
-
-Use this in a Colab notebook:
+## Setup
 
 ```bash
+pip install -r requirements.txt
+```
+
+A HuggingFace token with access to the BEHAVIOR-1K dataset is required:
+
+```bash
+huggingface-cli login
+# or
+export HF_TOKEN=<your_token>
+```
+
+## Running the Pipeline
+
+### Step 1 — Download and sample episodes
+
+```bash
+python base_dataset.py
+```
+
+Reads `configs/base_dataset.yaml`, samples episodes up to the configured time budget, and writes raw files plus `base_dataset/manifest.json`.
+
+### Step 2 — Encode with V-JEPA2
+
+```bash
+# V-JEPA2 (HuggingFace backend, 256px)
+python encode_behavior_dataset.py --fname configs/behavior-vjepa2-vitg16-256px-16f.yaml
+
+# V-JEPA 2.1 (native backend, 384px)
+python encode_behavior_dataset.py --fname configs/behavior-vjepa21-vitg16-384px-16f.yaml
+```
+
+Encodes all episodes in the manifest and streams MDS shards to HuggingFace concurrently.
+
+### Step 3 — Validate shards
+
+```bash
+jupyter notebook test_preencoded_dataset.ipynb
+```
+
+Runs schema, episode completeness, action/state alignment, and token shape checks.
+
+## Configuration
+
+### `configs/base_dataset.yaml` — episode sampling
+
+| Key | Description |
+|---|---|
+| `camera_view_type` | `"head"` or `"multi"` (head + left/right wrist cameras) |
+| `dataset_size` | Time budget in hours |
+| `seed` | Random seed for deterministic sampling |
+| `eval_tasks` | Tasks fully included regardless of budget |
+| `exclude_eval_tasks` | Exclude eval tasks from the sampled split |
+| `base_dataset_destination` | Output directory for raw episodes |
+
+### `configs/behavior-vjepa2-vitg16-256px-16f.yaml` — encoding (HF backend)
+
+| Key | Description |
+|---|---|
+| `model.hf_repo` | HuggingFace model repo (e.g. `facebook/vjepa2-vitg-fpc64-256`) |
+| `data.fps` | Frame sampling rate |
+| `data.crop_size` | Spatial crop resolution |
+| `data.camera_view` | `"head"` or `"multi"` |
+| `output.hf_repo_id` | Destination HF dataset repo for MDS shards |
+| `output.max_shard_bytes` | Max shard size (default 1 GiB) |
+
+### `configs/behavior-vjepa21-vitg16-384px-16f.yaml` — encoding (native backend)
+
+Same structure as above but uses `model.backend: native_vjepa21` and `model.model_name` to select the architecture (`vjepa2_1_vit_base_384`, `vjepa2_1_vit_large_384`, `vjepa2_1_vit_giant_384`, `vjepa2_1_vit_gigantic_384`).
+
+## MDS Shard Schema
+
+Each shard row contains one fixed-length clip (8 frames) from one camera view:
+
+| Column | Type | Description |
+|---|---|---|
+| `tokens_head` | `bfloat16 [N, D]` | V-JEPA2 tubelets from head camera |
+| `tokens_left` | `bfloat16 [N, D]` | V-JEPA2 tubelets from left wrist |
+| `tokens_right` | `bfloat16 [N, D]` | V-JEPA2 tubelets from right wrist |
+| `actions` | `float32 [T, 23]` | Robot joint actions |
+| `states` | `float32 [T, 133]` | Proprioceptive state (133-dim curated subset) |
+| `cam_rel_poses` | `float32` | Camera relative poses |
+| `frame_index` | `int` | Start frame index within the episode |
+| `episode_idx` | `int` | Episode index |
+
+## Proprioceptive State (`PROPRIO_DIM = 133`)
+
+The 133-dim state vector is a curated subset of the raw 256-dim `observation.state` from BEHAVIOR-1K, selecting only sensor-observable quantities suitable for real-robot transfer:
+
+- `[6:28]` — controllable joint positions (torso + arms + grippers)
+- `[34:56]` — joint position sine encodings
+- `[62:84]` — joint position cosine encodings
+- `[84:112]` — joint velocities (all joints)
+- `[152:158]` — linear and angular velocity (IMU)
+- `[186:197]` — left end-effector pose + gripper state
+- `[225:244]` — right end-effector pose + gripper state + trunk
+- `[253:256]` — base encoder velocity
+
+Simulator-only global state (absolute position, accumulated odometry) is excluded.
+
+## Running in Google Colab
+
+```python
 # 1) Clone repo
 !git clone <YOUR_REPO_URL>
 %cd BEHAVIOR_challenge_dataset
@@ -22,25 +136,23 @@ Use this in a Colab notebook:
 # 2) Install deps
 !pip install -r requirements.txt
 
-# 3) (Optional) set HF token for private/gated repos
+# 3) Set HF token
 import os
 os.environ["HF_TOKEN"] = "<your_token>"
 
 # 4) Run pipeline
-!python -m main
+!python base_dataset.py
+!python encode_behavior_dataset.py --fname configs/behavior-vjepa2-vitg16-256px-16f.yaml
 ```
 
-### Optional: edit dataset config first
+## Architecture
 
-Open `configs/dataset.yaml` and set:
+**`base_dataset.py` / `base_dataset_utils.py`** — `BaseDataset` loads task/episode metadata from the remote BEHAVIOR-1K HuggingFace repo, samples episodes per task up to the time budget, downloads parquet (actions/states), MP4 (video), and JSON (meta) files locally, then writes `manifest.json`.
 
-- `base_dataset_destination`
-- `dataset_size`
-- `camera_view_type`
-- `exclude_eval_tasks`
+**`behavior.py`** — `BehaviorVideoDataset` is a PyTorch `Dataset` that reads the manifest and yields fixed-length 8-frame clips: loads frames via Decord, extracts the 133-dim proprioceptive state, and returns `{video, actions, states}`. `BehaviorEpisodePreencoder` wraps this with a DataLoader, runs the encoder over full episodes, accumulates tokenized tubelets, writes MDS shards via `MDSWriter`, and concurrently uploads completed shards to HuggingFace via a background `_ShardUploader` thread.
 
-Then rerun:
+**`encode_behavior_dataset.py`** — `HFVJEPA2Encoder` loads V-JEPA2 via HuggingFace `AutoModel`. `NativeVJEPA21Encoder` loads V-JEPA 2.1 via the native repo factory. Both expose an `encode_frames(video_tensor) → tokens` interface.
 
-```bash
-!python -m main
-```
+## License
+
+See [LICENSE](LICENSE).
