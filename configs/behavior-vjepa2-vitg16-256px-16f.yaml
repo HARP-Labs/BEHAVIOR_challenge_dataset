@@ -11,7 +11,7 @@ data:
   datasets:
     - /content/base_dataset/manifest.json
   dataset_fpcs:
-    - 16
+    - 32
   batch_size: 4
   fps: 5
   crop_size: 256
@@ -22,9 +22,9 @@ data:
   camera_view: multi  # "head" or "multi" (head + left_wrist + right_wrist)
   # state_dim is fixed at 133 by BehaviorVideoDataset.PROPRIO_SLICES — not configurable here
   action_dim: 23
-  cache_parquet: false
+  cache_parquet: true
   cache_video_readers: false
-  cache_max_entries: 3
+  cache_max_entries: 12
 
 data_aug:
   auto_augment: false
