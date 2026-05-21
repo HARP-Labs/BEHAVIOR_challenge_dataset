@@ -587,8 +587,7 @@ class _ShardUploader:
                 if attempt == 2:
                     raise
                 time.sleep(5 * (attempt + 1))
-        with self._lock:
-            self._uploaded.update(fpaths)
+        self._uploaded.update(fpaths)
         if self._delete_local:
             for fpath in fpaths:
                 if fpath.endswith(".mds"):
