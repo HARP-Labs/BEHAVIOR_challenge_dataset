@@ -135,6 +135,7 @@ def main(cfg_path: str):
         pin_memory=data_cfg.get("pin_mem", True),
         persistent_workers=data_cfg.get("persistent_workers", True),
         prefetch_factor=data_cfg.get("prefetch_factor", 2),
+        commit_batch_size=out_cfg.get("commit_batch_size", 20),
     )
 
 

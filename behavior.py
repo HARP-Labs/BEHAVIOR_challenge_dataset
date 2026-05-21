@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 import torch.utils.data
 from decord import VideoReader, cpu
-from huggingface_hub import HfApi
+from huggingface_hub import CommitOperationAdd, HfApi
 
 logger = getLogger()
 
@@ -488,34 +488,37 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         return vr
 
 class _ShardUploader:
-    """Uploads completed MDS shards to HF in a background thread.
+    """Uploads completed MDS shards to HF using batched commits.
 
-    Polls write_dir every 30 s for new shard.*.mds files.  All but the last
-    shard are considered complete and safe to upload (the last one may still
-    be open by MDSWriter).  call stop_and_flush() after MDSWriter exits to
-    drain remaining shards and index.json.
+    Polls write_dir every ``poll_interval`` seconds for new shard.*.mds files.
+    All but the last shard are considered complete and safe to upload (the last
+    one may still be open by MDSWriter).  Call stop_and_flush() after MDSWriter
+    exits to drain remaining shards; index.json is always uploaded last so HF
+    readers never observe a manifest that references missing shards.
 
     When delete_local=True (HF-only mode), each shard is removed from disk
-    immediately after a successful upload to keep disk usage bounded.
+    immediately after a successful batch commit to keep disk usage bounded.
+
+    Batching: ``commit_batch_size`` shards are accumulated and pushed in a single
+    ``create_commit`` call, keeping the total number of HF commits well below the
+    128-per-hour API rate limit.
     """
 
-    def __init__(self, write_dir, api, repo_id, path_in_repo, delete_local):
-        """Initialize the uploader but do not start the background thread yet.
-
-        Args:
-            write_dir: Local directory that ``MDSWriter`` writes shards into.
-            api: Authenticated ``huggingface_hub.HfApi`` instance.
-            repo_id: HuggingFace dataset repository ID (e.g. ``"org/repo"``).
-            path_in_repo: Prefix path inside the repository for all uploaded
-                files.  Pass ``None`` or an empty string for the repo root.
-            delete_local: If True, each shard is removed from disk immediately
-                after a successful upload.
-        """
-        self._write_dir    = write_dir
-        self._api          = api
-        self._repo_id      = repo_id
-        self._path_in_repo = path_in_repo
-        self._delete_local = delete_local
+    def __init__(self, write_dir, api, repo_id, path_in_repo, delete_local,
+                 commit_batch_size=20, poll_interval=5):
+        self._write_dir        = write_dir
+        self._api              = api
+        self._repo_id          = repo_id
+        self._path_in_repo     = path_in_repo
+        self._delete_local     = delete_local
+        self._commit_batch_size = commit_batch_size
+        self._poll_interval    = poll_interval
+        # hf_transfer: Rust-backed upload chunking — 2-5× faster when installed.
+        try:
+            import hf_transfer as _  # noqa: F401
+            os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        except ImportError:
+            pass
         try:
             import huggingface_hub.utils as _hf_utils
             import huggingface_hub.utils.logging as _hf_logging
@@ -523,78 +526,71 @@ class _ShardUploader:
             _hf_logging.set_verbosity_error()
         except Exception:
             pass
-        self._uploaded     = set()
-        self._error        = None
-        self._stop         = threading.Event()
-        self._thread       = threading.Thread(target=self._loop, daemon=True)
+        self._uploaded = set()
+        self._lock     = threading.Lock()
+        self._stop     = threading.Event()
+        self._thread   = threading.Thread(target=self._loop, daemon=True)
 
     def start(self):
-        """Start the background polling thread."""
         self._thread.start()
 
     def stop_and_flush(self):
-        """Signal the thread to stop, wait for it, then upload remaining files.
+        """Stop polling, commit remaining shards in batches, then index.json last.
 
-        Should be called after ``MDSWriter`` has exited so that the final shard
-        and ``index.json`` are complete and safe to upload.
-
-        Raises:
-            RuntimeError: If the background thread encountered an unhandled
-                exception during uploading.
+        index.json is committed only after all shard batches succeed so that HF
+        readers never see a manifest referencing shards that are not yet present.
         """
         self._stop.set()
         self._thread.join()
-        if self._error:
-            raise RuntimeError("Background shard upload failed") from self._error
-        self._process(final=True)
+        # Commit any shards not yet uploaded (MDSWriter has exited — last shard is safe).
+        self._commit_pending(all_shards=True)
+        # Commit index.json as a final single-file commit.
+        index = os.path.join(self._write_dir, "index.json")
+        if os.path.exists(index) and index not in self._uploaded:
+            self._commit_files([index])
 
     def _loop(self):
-        """Background thread body: poll for new shards every 30 seconds."""
-        try:
-            while not self._stop.wait(timeout=30):
-                self._process(final=False)
-        except Exception as e:
-            self._error = e
+        while not self._stop.wait(timeout=self._poll_interval):
+            self._commit_pending(all_shards=False)
 
-    def _process(self, final):
-        """Upload any not-yet-uploaded shards (and optionally ``index.json``).
-
-        When ``final`` is False the last shard is skipped because
-        ``MDSWriter`` may still be writing to it.  When ``final`` is True all
-        shards and ``index.json`` are included.  Each file is retried up to
-        three times with back-off on failure.
-
-        Args:
-            final: If True, include the last shard and ``index.json``.
-        """
+    def _commit_pending(self, all_shards):
+        """Commit not-yet-uploaded shards in batches of commit_batch_size."""
         shards = sorted(glob.glob(os.path.join(self._write_dir, "shard.*.mds")))
-        # Skip the last shard unless final — MDSWriter may still be writing to it.
-        targets = shards if final else shards[:-1]
-        if final:
-            index = os.path.join(self._write_dir, "index.json")
-            if os.path.exists(index):
-                targets = targets + [index]
-        for fpath in targets:
-            if fpath in self._uploaded:
-                continue
+        with self._lock:
+            pending = [f for f in (shards if all_shards else shards[:-1])
+                       if f not in self._uploaded]
+        for i in range(0, len(pending), self._commit_batch_size):
+            self._commit_files(pending[i:i + self._commit_batch_size])
+
+    def _commit_files(self, fpaths):
+        """Create a single HF commit containing all fpaths, then delete if configured."""
+        ops = []
+        for fpath in fpaths:
             fname   = os.path.basename(fpath)
             in_repo = f"{self._path_in_repo}/{fname}" if self._path_in_repo else fname
-            for attempt in range(3):
-                try:
-                    self._api.upload_file(
-                        path_or_fileobj=fpath,
-                        path_in_repo=in_repo,
-                        repo_id=self._repo_id,
-                        repo_type="dataset",
-                    )
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    time.sleep(5 * (attempt + 1))
-            self._uploaded.add(fpath)
-            if self._delete_local and fpath.endswith(".mds"):
-                os.remove(fpath)
+            ops.append(CommitOperationAdd(path_in_repo=in_repo, path_or_fileobj=fpath))
+        for attempt in range(3):
+            try:
+                self._api.create_commit(
+                    repo_id=self._repo_id,
+                    repo_type="dataset",
+                    operations=ops,
+                    commit_message=f"Upload {len(fpaths)} shard(s)",
+                )
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(5 * (attempt + 1))
+        with self._lock:
+            self._uploaded.update(fpaths)
+        if self._delete_local:
+            for fpath in fpaths:
+                if fpath.endswith(".mds"):
+                    try:
+                        os.remove(fpath)
+                    except FileNotFoundError:
+                        pass
 
 
 class BehaviorEpisodePreencoder:
@@ -737,7 +733,7 @@ class BehaviorEpisodePreencoder:
         return {**token_cols, **BehaviorEpisodePreencoder._MDS_COLUMNS_BASE}
 
     @torch.inference_mode()
-    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4):
+    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, commit_batch_size=20):
         """Encode all episodes and write them as MDS shards.
 
         Iterates over ``dataset`` in window order, encodes each batch with the
@@ -764,10 +760,13 @@ class BehaviorEpisodePreencoder:
             persistent_workers: If True, keep data-loader worker processes
                 alive between batches.
             prefetch_factor: Number of batches to prefetch per worker.
+            commit_batch_size: Number of shards bundled into each HF commit.
+                Higher values mean fewer commits (avoids the 128/hour rate
+                limit) at the cost of holding more shards on disk at once.
+                Defaults to 20.
 
         Raises:
             ValueError: If neither ``output_dir`` nor ``hf_repo_id`` is given.
-            RuntimeError: If the background shard uploader fails.
         """
         if not output_dir and not hf_repo_id:
             raise ValueError("Either output_dir or hf_repo_id must be provided")
@@ -804,6 +803,7 @@ class BehaviorEpisodePreencoder:
                 repo_id=hf_repo_id,
                 path_in_repo=hf_path_prefix.strip("/") or None,
                 delete_local=(tmp_dir is not None),
+                commit_batch_size=commit_batch_size,
             )
             uploader.start()
 
