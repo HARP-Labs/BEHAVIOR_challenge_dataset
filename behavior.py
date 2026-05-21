@@ -236,7 +236,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         # Use the first view's video to determine FPS and length.
         vpath = next(iter(sample["video_paths"].values()))
         ppath = sample["parquet_path"]
-        vr = VideoReader(vpath, num_threads=1, ctx=cpu(0))
+        vr = VideoReader(vpath, num_threads=2, ctx=cpu(0))
         try:
             vfps = vr.get_avg_fps()
             vlen = len(vr)
@@ -385,9 +385,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             )
 
         states = self._extract_proprio(full_states)
-        first_vr = self._get_video_reader(first_vpath)
         fstp = plan["fstp"]
-        max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0], len(first_vr))
+        max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0])
         indices = plan["indices"]
 
         if len(indices) == 0:
@@ -478,13 +477,13 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             ``decord.VideoReader`` instance for the requested file.
         """
         if not self.cache_video_readers:
-            return VideoReader(vpath, num_threads=1, ctx=cpu(0))
+            return VideoReader(vpath, num_threads=2, ctx=cpu(0))
         cached = self._video_reader_cache.get(vpath)
         if cached is not None:
             return cached
         if len(self._video_reader_cache) >= self._cache_max_entries:
             self._video_reader_cache.pop(next(iter(self._video_reader_cache)))
-        vr = VideoReader(vpath, num_threads=1, ctx=cpu(0))
+        vr = VideoReader(vpath, num_threads=2, ctx=cpu(0))
         self._video_reader_cache[vpath] = vr
         return vr
 
