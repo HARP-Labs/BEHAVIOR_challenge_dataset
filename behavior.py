@@ -554,11 +554,19 @@ class _ShardUploader:
             self._commit_pending(all_shards=False)
 
     def _commit_pending(self, all_shards):
-        """Commit not-yet-uploaded shards in batches of commit_batch_size."""
+        """Commit not-yet-uploaded shards in batches of commit_batch_size.
+
+        During polling (all_shards=False) only full batches are committed so
+        shards accumulate to the target batch size before a commit is made.
+        On flush (all_shards=True) any remaining partial batch is committed too.
+        """
         shards = sorted(glob.glob(os.path.join(self._write_dir, "shard.*.mds")))
         with self._lock:
             pending = [f for f in (shards if all_shards else shards[:-1])
                        if f not in self._uploaded]
+        if not all_shards:
+            # Trim to the largest multiple of batch size so partial batches wait.
+            pending = pending[:len(pending) - len(pending) % self._commit_batch_size]
         for i in range(0, len(pending), self._commit_batch_size):
             self._commit_files(pending[i:i + self._commit_batch_size])
 
