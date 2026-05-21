@@ -806,11 +806,12 @@ class BehaviorEpisodePreencoder:
                 for batch_idx, batch in enumerate(pbar):
                     if batch_idx % 10 == 0:
                         pbar.set_postfix_str(self._gpu_status())
-                    tokens_by_view = {
-                        view: self._encode_batch(batch["video"][view],self.temporal_patch_size)
-                        for view in views
-                    }
-                    batch_size = next(iter(tokens_by_view.values())).shape[0]
+                    nv = len(views)
+                    cat_video = torch.cat([batch["video"][view] for view in views], dim=0)
+                    cat_tokens = self._encode_batch(cat_video, self.temporal_patch_size)
+                    real_b = cat_tokens.shape[0] // nv
+                    tokens_by_view = {view: cat_tokens[i * real_b:(i + 1) * real_b] for i, view in enumerate(views)}
+                    batch_size = real_b
                     for b in range(batch_size):
                         self._accumulate(state, dataset, writer, tokens_by_view, batch, b)
                 self._flush_active_episode(state, dataset, writer)
@@ -931,7 +932,7 @@ class BehaviorEpisodePreencoder:
         # Encode each frame independently: flatten batch and time, duplicate
         # each frame to satisfy the encoder's tubelet_size expectation.
         v = v.permute(0, 2, 1, 3, 4).reshape(B * T, C, 1, H, W)  # [B*T, C, 1, H, W]
-        v = v.expand(-1, -1, temporal_patch_size, -1, -1).contiguous() # [B*T, C, tps, H, W]
+        v = v.repeat(1, 1, temporal_patch_size, 1, 1)  # [B*T, C, tps, H, W]
         tokens = self.encoder(v)
         if isinstance(tokens, (tuple, list)):
             tokens = tokens[0]
