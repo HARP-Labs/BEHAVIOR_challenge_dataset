@@ -9,7 +9,6 @@ import glob
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import random
 import threading
@@ -527,7 +526,6 @@ class _ShardUploader:
         except Exception:
             pass
         self._uploaded = set()
-        self._lock     = threading.Lock()
         self._stop     = threading.Event()
         self._thread   = threading.Thread(target=self._loop, daemon=True)
 
@@ -561,9 +559,8 @@ class _ShardUploader:
         On flush (all_shards=True) any remaining partial batch is committed too.
         """
         shards = sorted(glob.glob(os.path.join(self._write_dir, "shard.*.mds")))
-        with self._lock:
-            pending = [f for f in (shards if all_shards else shards[:-1])
-                       if f not in self._uploaded]
+        pending = [f for f in (shards if all_shards else shards[:-1])
+                   if f not in self._uploaded]
         if not all_shards:
             # Trim to the largest multiple of batch size so partial batches wait.
             pending = pending[:len(pending) - len(pending) % self._commit_batch_size]
@@ -697,28 +694,6 @@ class BehaviorEpisodePreencoder:
             "valid_len": np.asarray([item["valid_len"] for item in batch], dtype=np.int64),
         }
 
-    @staticmethod
-    def _gpu_status():
-        """Return a short GPU utilisation string from ``nvidia-smi``.
-
-        Returns:
-            String of the form ``"gpu=<util>% mem=<used>/<total>MB"``, or
-            ``"gpu=n/a"`` if ``nvidia-smi`` is unavailable.
-        """
-        try:
-            out = subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=utilization.gpu,memory.used,memory.total",
-                    "--format=csv,noheader,nounits",
-                ],
-                stderr=subprocess.DEVNULL,
-            ).decode().strip().splitlines()[0]
-            util, mem_used, mem_total = [x.strip() for x in out.split(",")]
-            return f"gpu={util}% mem={mem_used}/{mem_total}MB"
-        except Exception:
-            return "gpu=n/a"
-
     _MDS_COLUMNS_BASE = {
         "actions":       "ndarray",  # (fstp * action_dim,) — raw actions from frame f to frame f+1
         "states":        "ndarray",  # (state_dim,) — robot state at frame f
@@ -820,9 +795,7 @@ class BehaviorEpisodePreencoder:
         try:
             with MDSWriter(out=write_dir, columns=mds_columns, size_limit=max_shard_bytes) as writer:
                 pbar = tqdm(data_loader, desc="Encoding batches")
-                for batch_idx, batch in enumerate(pbar):
-                    if batch_idx % 10 == 0:
-                        pbar.set_postfix_str(self._gpu_status())
+                for batch in pbar:
                     nv = len(views)
                     cat_video = torch.cat([batch["video"][view] for view in views], dim=0)
                     cat_tokens = self._encode_batch(cat_video, self.temporal_patch_size)
