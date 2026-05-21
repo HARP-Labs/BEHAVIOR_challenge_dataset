@@ -136,6 +136,8 @@ def main(cfg_path: str):
         persistent_workers=data_cfg.get("persistent_workers", True),
         prefetch_factor=data_cfg.get("prefetch_factor", 2),
         commit_batch_size=out_cfg.get("commit_batch_size", 20),
+        num_upload_workers=out_cfg.get("num_upload_workers", 1),
+        max_pending_shards=out_cfg.get("max_pending_shards"),
     )
 
 

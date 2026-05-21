@@ -43,3 +43,5 @@ output:
   hf_path_prefix: shards_256px_vit_16_g
   max_shard_bytes: 1073741824  # 1 GiB
   commit_batch_size: 20  # shards per HF commit; keeps total commits well below 128/hour limit
+  num_upload_workers: 4  # concurrent HF commits; hides API round-trip latency
+  max_pending_shards: 40  # pause encoding when this many shards are waiting (~40 GiB at 1 GiB/shard)

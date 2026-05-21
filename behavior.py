@@ -13,6 +13,7 @@ import tempfile
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from logging import getLogger
 from math import ceil
 from tqdm import tqdm
@@ -504,7 +505,7 @@ class _ShardUploader:
     """
 
     def __init__(self, write_dir, api, repo_id, path_in_repo, delete_local,
-                 commit_batch_size=20, poll_interval=5):
+                 commit_batch_size=20, poll_interval=5, num_upload_workers=1):
         self._write_dir        = write_dir
         self._api              = api
         self._repo_id          = repo_id
@@ -525,9 +526,13 @@ class _ShardUploader:
             _hf_logging.set_verbosity_error()
         except Exception:
             pass
-        self._uploaded = set()
-        self._stop     = threading.Event()
-        self._thread   = threading.Thread(target=self._loop, daemon=True)
+        self._uploaded  = set()
+        self._in_flight = set()
+        self._lock      = threading.Lock()
+        self._futures   = []
+        self._executor  = ThreadPoolExecutor(max_workers=num_upload_workers)
+        self._stop      = threading.Event()
+        self._thread    = threading.Thread(target=self._loop, daemon=True)
 
     def start(self):
         self._thread.start()
@@ -540,8 +545,15 @@ class _ShardUploader:
         """
         self._stop.set()
         self._thread.join()
+        # Drain any in-flight uploads started by the polling loop.
+        for f in self._futures:
+            f.result()
+        self._futures.clear()
         # Commit any shards not yet uploaded (MDSWriter has exited — last shard is safe).
         self._commit_pending(all_shards=True)
+        for f in self._futures:
+            f.result()
+        self._executor.shutdown(wait=True)
         # Commit index.json as a final single-file commit.
         index = os.path.join(self._write_dir, "index.json")
         if os.path.exists(index) and index not in self._uploaded:
@@ -557,15 +569,20 @@ class _ShardUploader:
         During polling (all_shards=False) only full batches are committed so
         shards accumulate to the target batch size before a commit is made.
         On flush (all_shards=True) any remaining partial batch is committed too.
+        Batches are submitted to the thread-pool executor for concurrent uploads.
         """
         shards = sorted(glob.glob(os.path.join(self._write_dir, "shard.*.mds")))
-        pending = [f for f in (shards if all_shards else shards[:-1])
-                   if f not in self._uploaded]
+        with self._lock:
+            pending = [f for f in (shards if all_shards else shards[:-1])
+                       if f not in self._uploaded and f not in self._in_flight]
         if not all_shards:
             # Trim to the largest multiple of batch size so partial batches wait.
             pending = pending[:len(pending) - len(pending) % self._commit_batch_size]
         for i in range(0, len(pending), self._commit_batch_size):
-            self._commit_files(pending[i:i + self._commit_batch_size])
+            batch = pending[i:i + self._commit_batch_size]
+            with self._lock:
+                self._in_flight.update(batch)
+            self._futures.append(self._executor.submit(self._commit_files, batch))
 
     def _commit_files(self, fpaths):
         """Create a single HF commit containing all fpaths, then delete if configured."""
@@ -574,20 +591,27 @@ class _ShardUploader:
             fname   = os.path.basename(fpath)
             in_repo = f"{self._path_in_repo}/{fname}" if self._path_in_repo else fname
             ops.append(CommitOperationAdd(path_in_repo=in_repo, path_or_fileobj=fpath))
-        for attempt in range(3):
-            try:
-                self._api.create_commit(
-                    repo_id=self._repo_id,
-                    repo_type="dataset",
-                    operations=ops,
-                    commit_message=f"Upload {len(fpaths)} shard(s)",
-                )
-                break
-            except Exception:
-                if attempt == 2:
-                    raise
-                time.sleep(5 * (attempt + 1))
-        self._uploaded.update(fpaths)
+        try:
+            for attempt in range(3):
+                try:
+                    self._api.create_commit(
+                        repo_id=self._repo_id,
+                        repo_type="dataset",
+                        operations=ops,
+                        commit_message=f"Upload {len(fpaths)} shard(s)",
+                    )
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(5 * (attempt + 1))
+            with self._lock:
+                self._uploaded.update(fpaths)
+                self._in_flight.difference_update(fpaths)
+        except Exception:
+            with self._lock:
+                self._in_flight.difference_update(fpaths)
+            raise
         if self._delete_local:
             for fpath in fpaths:
                 if fpath.endswith(".mds"):
@@ -595,6 +619,17 @@ class _ShardUploader:
                         os.remove(fpath)
                     except FileNotFoundError:
                         pass
+
+    def pending_count(self) -> int:
+        """Number of shard files on disk not yet successfully uploaded."""
+        shards = glob.glob(os.path.join(self._write_dir, "shard.*.mds"))
+        with self._lock:
+            return len([s for s in shards if s not in self._uploaded])
+
+    def wait_until_below(self, threshold: int, check_interval: float = 10.0):
+        """Block until fewer than ``threshold`` shards are pending upload."""
+        while self.pending_count() >= threshold:
+            time.sleep(check_interval)
 
 
 class BehaviorEpisodePreencoder:
@@ -715,7 +750,7 @@ class BehaviorEpisodePreencoder:
         return {**token_cols, **BehaviorEpisodePreencoder._MDS_COLUMNS_BASE}
 
     @torch.inference_mode()
-    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, commit_batch_size=20):
+    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, commit_batch_size=20, num_upload_workers=1, max_pending_shards=None):
         """Encode all episodes and write them as MDS shards.
 
         Iterates over ``dataset`` in window order, encodes each batch with the
@@ -746,6 +781,14 @@ class BehaviorEpisodePreencoder:
                 Higher values mean fewer commits (avoids the 128/hour rate
                 limit) at the cost of holding more shards on disk at once.
                 Defaults to 20.
+            num_upload_workers: Number of threads submitting concurrent HF
+                commits. Values > 1 hide API round-trip latency and improve
+                upload throughput when the bottleneck is API concurrency rather
+                than raw bandwidth. Defaults to 1.
+            max_pending_shards: If set, pause encoding whenever this many
+                shards are waiting on disk to be uploaded. Acts as a hard cap
+                on disk usage (``max_pending_shards * max_shard_bytes``).
+                ``None`` disables backpressure (default).
 
         Raises:
             ValueError: If neither ``output_dir`` nor ``hf_repo_id`` is given.
@@ -786,6 +829,7 @@ class BehaviorEpisodePreencoder:
                 path_in_repo=hf_path_prefix.strip("/") or None,
                 delete_local=(tmp_dir is not None),
                 commit_batch_size=commit_batch_size,
+                num_upload_workers=num_upload_workers,
             )
             uploader.start()
 
@@ -795,6 +839,8 @@ class BehaviorEpisodePreencoder:
             with MDSWriter(out=write_dir, columns=mds_columns, size_limit=max_shard_bytes) as writer:
                 pbar = tqdm(data_loader, desc="Encoding batches")
                 for batch in pbar:
+                    if uploader and max_pending_shards is not None:
+                        uploader.wait_until_below(max_pending_shards)
                     nv = len(views)
                     cat_video = torch.cat([batch["video"][view] for view in views], dim=0)
                     cat_tokens = self._encode_batch(cat_video, self.temporal_patch_size)
