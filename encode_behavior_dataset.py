@@ -112,6 +112,7 @@ def main(cfg_path: str):
         action_dim=data_cfg.get("action_dim", 23),
         cache_parquet=data_cfg.get("cache_parquet", False),
         cache_video_readers=data_cfg.get("cache_video_readers", False),
+        cache_max_entries=data_cfg.get("cache_max_entries", 12),
     )
 
     preencoder = BehaviorEpisodePreencoder(

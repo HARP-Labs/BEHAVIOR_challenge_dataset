@@ -84,6 +84,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         action_dim=23,
         cache_parquet=False,
         cache_video_readers=False,
+        cache_max_entries=12,
     ):
         """Initialize the dataset from a JSON manifest file.
 
@@ -101,6 +102,10 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 repeated disk reads across workers.
             cache_video_readers: If True, keep ``VideoReader`` objects alive
                 between calls to ``loadvideo_decord``.
+            cache_max_entries: Maximum number of entries kept in each per-worker
+                cache dict. When the limit is reached the oldest entry is evicted
+                (FIFO). Default of 12 covers ~4 episodes x 3 views per worker
+                without unbounded RAM growth.
         """
         if camera_view not in self.CAMERA_VIEWS:
             raise ValueError(f"camera_view must be one of {list(self.CAMERA_VIEWS)}. Got: {camera_view!r}")
@@ -115,6 +120,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self.action_dim = action_dim
         self.cache_parquet = cache_parquet
         self.cache_video_readers = cache_video_readers
+        self._cache_max_entries = cache_max_entries
         self._parquet_cache = {}
         self._video_reader_cache = {}
 
@@ -456,6 +462,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         cached = self._parquet_cache.get(ppath)
         if cached is not None:
             return cached
+        if len(self._parquet_cache) >= self._cache_max_entries:
+            self._parquet_cache.pop(next(iter(self._parquet_cache)))
         df = pd.read_parquet(ppath)
         self._parquet_cache[ppath] = df
         return df
@@ -474,6 +482,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         cached = self._video_reader_cache.get(vpath)
         if cached is not None:
             return cached
+        if len(self._video_reader_cache) >= self._cache_max_entries:
+            self._video_reader_cache.pop(next(iter(self._video_reader_cache)))
         vr = VideoReader(vpath, num_threads=1, ctx=cpu(0))
         self._video_reader_cache[vpath] = vr
         return vr

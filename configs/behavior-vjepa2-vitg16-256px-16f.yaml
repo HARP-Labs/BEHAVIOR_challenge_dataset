@@ -15,7 +15,7 @@ data:
   batch_size: 4
   fps: 5
   crop_size: 256
-  num_workers: 4
+  num_workers: 8
   persistent_workers: true
   prefetch_factor: 4
   pin_mem: true
@@ -24,6 +24,7 @@ data:
   action_dim: 23
   cache_parquet: true
   cache_video_readers: true
+  cache_max_entries: 12
 
 data_aug:
   auto_augment: false
