@@ -476,7 +476,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 buf = vr.get_batch(safe_indices).asnumpy()
             if self.transform is not None:
                 buf = self.transform(buf)
-            self._cached_frame_shape[view] = tuple(buf.shape) if hasattr(buf, "shape") else tuple(buf.size())
+            self._cached_frame_shape[view] = tuple(buf.shape)
             buffers[view] = buf
         return buffers, actions, states, cam_rel_poses, window_indices
 
