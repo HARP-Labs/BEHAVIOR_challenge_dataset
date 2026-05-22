@@ -9,6 +9,7 @@ import glob
 import json
 import os
 import shutil
+import socket
 import tempfile
 import random
 import threading
@@ -505,14 +506,16 @@ class _ShardUploader:
     """
 
     def __init__(self, write_dir, api, repo_id, path_in_repo, delete_local,
-                 commit_batch_size=20, poll_interval=5, num_upload_workers=1):
-        self._write_dir        = write_dir
-        self._api              = api
-        self._repo_id          = repo_id
-        self._path_in_repo     = path_in_repo
-        self._delete_local     = delete_local
+                 commit_batch_size=20, poll_interval=5, num_upload_workers=1,
+                 upload_timeout=600):
+        self._write_dir         = write_dir
+        self._api               = api
+        self._repo_id           = repo_id
+        self._path_in_repo      = path_in_repo
+        self._delete_local      = delete_local
         self._commit_batch_size = commit_batch_size
-        self._poll_interval    = poll_interval
+        self._poll_interval     = poll_interval
+        self._upload_timeout    = upload_timeout
         # hf_transfer: Rust-backed upload chunking — 2-5× faster when installed.
         try:
             import hf_transfer as _  # noqa: F401
@@ -526,35 +529,64 @@ class _ShardUploader:
             _hf_logging.set_verbosity_error()
         except Exception:
             pass
-        self._uploaded  = set()
-        self._in_flight = set()
-        self._lock      = threading.Lock()
-        self._futures   = []
-        self._executor  = ThreadPoolExecutor(max_workers=num_upload_workers)
-        self._stop      = threading.Event()
-        self._thread    = threading.Thread(target=self._loop, daemon=True)
+        self._uploaded    = set()
+        self._in_flight   = set()
+        self._lock        = threading.Lock()
+        self._commit_lock = threading.Lock()
+        self._futures     = []
+        self._executor    = ThreadPoolExecutor(max_workers=num_upload_workers)
+        self._stop        = threading.Event()
+        self._thread      = threading.Thread(target=self._loop, daemon=True)
+        # Bound all socket I/O in this process (incl. S3 PUT reads) so stalled
+        # connections raise socket.timeout rather than hanging forever.
+        socket.setdefaulttimeout(upload_timeout)
 
     def start(self):
         self._thread.start()
 
-    def stop_and_flush(self):
-        """Stop polling, commit remaining shards in batches, then index.json last.
+    def stop_and_flush(self, max_flush_retries: int = 3):
+        """Stop polling, retry all failed shards, then commit index.json last.
 
-        index.json is committed only after all shard batches succeed so that HF
-        readers never see a manifest referencing shards that are not yet present.
+        Drains in-flight futures (socket timeout bounds each one), retries any
+        batches that failed, then verifies every shard is in _uploaded before
+        committing index.json.  If shards cannot be uploaded after
+        max_flush_retries the repo is left without index.json and an error is
+        logged — a missing manifest is preferable to one referencing absent shards.
         """
         self._stop.set()
         self._thread.join()
-        # Drain any in-flight uploads started by the polling loop.
+        # Drain in-flight batches; socket.setdefaulttimeout bounds each attempt.
         for f in self._futures:
-            f.result()
+            try:
+                f.result()
+            except Exception as e:
+                logger.warning(f"Upload batch failed, scheduling retry: {e}")
         self._futures.clear()
-        # Commit any shards not yet uploaded (MDSWriter has exited — last shard is safe).
-        self._commit_pending(all_shards=True)
-        for f in self._futures:
-            f.result()
+        # Retry loop: _commit_files except-block already cleaned up _in_flight for
+        # failed batches, so _commit_pending picks those shards up as eligible again.
+        for attempt in range(max_flush_retries):
+            self._commit_pending(all_shards=True)
+            if not self._futures:
+                break
+            for f in self._futures:
+                try:
+                    f.result()
+                except Exception as e:
+                    logger.warning(f"Flush retry {attempt + 1}/{max_flush_retries} failed: {e}")
+            self._futures.clear()
         self._executor.shutdown(wait=True)
-        # Commit index.json as a final single-file commit.
+        # Verify every shard on disk is confirmed uploaded before touching index.json.
+        remaining = [
+            s for s in glob.glob(os.path.join(self._write_dir, "shard.*.mds"))
+            if s not in self._uploaded
+        ]
+        if remaining:
+            logger.error(
+                f"{len(remaining)} shard(s) could not be uploaded after "
+                f"{max_flush_retries} retries — skipping index.json to avoid a "
+                f"broken manifest. Missing: {remaining}"
+            )
+            return
         index = os.path.join(self._write_dir, "index.json")
         if os.path.exists(index) and index not in self._uploaded:
             self._commit_files([index])
@@ -571,6 +603,7 @@ class _ShardUploader:
         On flush (all_shards=True) any remaining partial batch is committed too.
         Batches are submitted to the thread-pool executor for concurrent uploads.
         """
+        self._futures = [f for f in self._futures if not f.done()]
         shards = sorted(glob.glob(os.path.join(self._write_dir, "shard.*.mds")))
         with self._lock:
             pending = [f for f in (shards if all_shards else shards[:-1])
@@ -585,26 +618,42 @@ class _ShardUploader:
             self._futures.append(self._executor.submit(self._commit_files, batch))
 
     def _commit_files(self, fpaths):
-        """Create a single HF commit containing all fpaths, then delete if configured."""
+        """Upload fpaths to HF LFS then create a single serialized commit.
+
+        Phase A (preupload_lfs_files) runs concurrently across workers — this is
+        the slow S3 upload step and benefits from parallelism.  Phase B
+        (create_commit) is serialized via _commit_lock so workers never race on
+        the same branch HEAD and produce 409 conflicts.
+        preupload_lfs_files is a no-op for small files (e.g. index.json) that
+        fall below the LFS threshold, so this method works for all file types.
+        """
         ops = []
         for fpath in fpaths:
             fname   = os.path.basename(fpath)
             in_repo = f"{self._path_in_repo}/{fname}" if self._path_in_repo else fname
             ops.append(CommitOperationAdd(path_in_repo=in_repo, path_or_fileobj=fpath))
         try:
-            for attempt in range(3):
-                try:
-                    self._api.create_commit(
-                        repo_id=self._repo_id,
-                        repo_type="dataset",
-                        operations=ops,
-                        commit_message=f"Upload {len(fpaths)} shard(s)",
-                    )
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    time.sleep(5 * (attempt + 1))
+            # Phase A: upload bytes to S3/LFS — parallel, no lock needed.
+            self._api.preupload_lfs_files(
+                repo_id=self._repo_id,
+                repo_type="dataset",
+                additions=ops,
+            )
+            # Phase B: commit — serialized to avoid HEAD conflicts.
+            with self._commit_lock:
+                for attempt in range(3):
+                    try:
+                        self._api.create_commit(
+                            repo_id=self._repo_id,
+                            repo_type="dataset",
+                            operations=ops,
+                            commit_message=f"Upload {len(fpaths)} shard(s)",
+                        )
+                        break
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                        time.sleep(2 * (attempt + 1))
             with self._lock:
                 self._uploaded.update(fpaths)
                 self._in_flight.difference_update(fpaths)
@@ -621,10 +670,10 @@ class _ShardUploader:
                         pass
 
     def pending_count(self) -> int:
-        """Number of shard files on disk not yet successfully uploaded."""
+        """Number of shard files on disk not yet dispatched to an upload worker."""
         shards = glob.glob(os.path.join(self._write_dir, "shard.*.mds"))
         with self._lock:
-            return len([s for s in shards if s not in self._uploaded])
+            return len([s for s in shards if s not in self._uploaded and s not in self._in_flight])
 
     def wait_until_below(self, threshold: int, check_interval: float = 10.0):
         """Block until fewer than ``threshold`` shards are pending upload."""
@@ -750,7 +799,7 @@ class BehaviorEpisodePreencoder:
         return {**token_cols, **BehaviorEpisodePreencoder._MDS_COLUMNS_BASE}
 
     @torch.inference_mode()
-    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, commit_batch_size=20, num_upload_workers=1, max_pending_shards=None):
+    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, commit_batch_size=20, num_upload_workers=1, max_pending_shards=None, upload_timeout=600):
         """Encode all episodes and write them as MDS shards.
 
         Iterates over ``dataset`` in window order, encodes each batch with the
@@ -830,6 +879,7 @@ class BehaviorEpisodePreencoder:
                 delete_local=(tmp_dir is not None),
                 commit_batch_size=commit_batch_size,
                 num_upload_workers=num_upload_workers,
+                upload_timeout=upload_timeout,
             )
             uploader.start()
 
