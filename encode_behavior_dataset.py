@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import ctypes
+import gc
 import importlib
 import os
 import torch
@@ -36,9 +38,13 @@ class NativeVJEPA21Encoder(torch.nn.Module):
 class HFVJEPA2Encoder(torch.nn.Module):
     """Wrapper exposing HF V-JEPA2 encoder features as a plain tensor."""
 
-    def __init__(self, hf_repo_id: str, temporal_patch_size: int = 2):
+    def __init__(self, hf_repo_id: str, temporal_patch_size: int = 2, torch_dtype=None):
         super().__init__()
-        self.model = AutoModel.from_pretrained(hf_repo_id)
+        self.model = AutoModel.from_pretrained(
+            hf_repo_id,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        )
         self._temporal_patch_size_fallback = temporal_patch_size
 
     @property
@@ -64,7 +70,7 @@ class HFVJEPA2Encoder(torch.nn.Module):
         return outputs.last_hidden_state
 
 
-def _build_encoder(model_cfg: dict) -> torch.nn.Module:
+def _build_encoder(model_cfg: dict, torch_dtype=None) -> torch.nn.Module:
     backend = model_cfg.get("backend", "hf")
     if backend == "native_vjepa21":
         model_name = model_cfg.get("model_name", "vjepa2_1_vit_giant_384")
@@ -73,7 +79,7 @@ def _build_encoder(model_cfg: dict) -> torch.nn.Module:
     else:
         hf_repo_id = model_cfg.get("hf_repo", "facebook/vjepa2-vitg-fpc64-256")
         temporal_patch_size = model_cfg.get("temporal_patch_size", 2)
-        return HFVJEPA2Encoder(hf_repo_id=hf_repo_id, temporal_patch_size=temporal_patch_size)
+        return HFVJEPA2Encoder(hf_repo_id=hf_repo_id, temporal_patch_size=temporal_patch_size, torch_dtype=torch_dtype)
 
 
 def main(cfg_path: str):
@@ -89,9 +95,19 @@ def main(cfg_path: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
-    encoder = _build_encoder(model_cfg).to(device=device, dtype=dtype)
+    encoder = _build_encoder(model_cfg, torch_dtype=dtype).to(device=device, dtype=dtype)
     if meta_cfg.get("compile", True) and device.type == "cuda":
         encoder = torch.compile(encoder, mode="reduce-overhead")
+
+    # Return freed CPU model pages to the OS before DataLoader forks workers.
+    # Without this, the float32 scratch used during from_pretrained stays in
+    # the allocator pool and gets COW-faulted into each worker (~4 GiB × 8
+    # workers = ~32 GiB of phantom RSS on Linux).
+    gc.collect()
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except OSError:
+        pass  # non-Linux (macOS, Windows) — malloc_trim not available
     print(f"backend={model_cfg.get('backend', 'hf')}  temporal_patch_size={encoder.temporal_patch_size}")
 
     transform = make_transforms(
