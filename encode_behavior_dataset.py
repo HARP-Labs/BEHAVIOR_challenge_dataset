@@ -40,7 +40,7 @@ class HFVJEPA2Encoder(torch.nn.Module):
 
     def __init__(self, hf_repo_id: str, temporal_patch_size: int = 2, torch_dtype=None, device=None):
         super().__init__()
-        kwargs: dict = {"torch_dtype": torch_dtype, "low_cpu_mem_usage": True}
+        kwargs: dict = {"dtype": torch_dtype, "low_cpu_mem_usage": True}
         if device is not None and str(device) != "cpu":
             # Load weights directly onto the target device — no CPU copy is ever
             # created, so there is nothing to free before DataLoader worker fork.

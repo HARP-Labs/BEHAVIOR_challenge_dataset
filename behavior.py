@@ -5,6 +5,8 @@ for _name in ("Iterator", "Mapping", "MutableMapping", "Sequence", "MutableSeque
     if not hasattr(collections, _name):
         setattr(collections, _name, getattr(collections.abc, _name))
 
+import ctypes
+import gc
 import glob
 import json
 import queue
@@ -125,6 +127,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self._cache_max_entries = cache_max_entries
         self._parquet_cache = {}
         self._video_reader_cache = {}
+        self._cached_frame_shape: dict = {}  # view → shape, populated on first successful decode
 
         manifest = self._load_manifest(data_path)
         self.samples = self._parse_samples(manifest)
@@ -320,6 +323,9 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             except Exception as e:
                 logger.warning(f"Attempt {attempt+1}/{max_retries} failed for sample={sample} {e=}")
                 if attempt == max_retries - 1:
+                    if all(v in self._cached_frame_shape for v in self.views):
+                        logger.warning(f"Returning skip sentinel for {sample}")
+                        return self._make_skip_sample(episode_idx, start_idx, plan)
                     raise
 
         valid_len = min(self.fpc, len(plan["indices"]) - start_idx)
@@ -332,6 +338,24 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             "episode_idx": episode_idx,
             "start_idx": start_idx,
             "valid_len": valid_len,
+        }
+
+    def _make_skip_sample(self, episode_idx: int, start_idx: int, plan: dict) -> dict:
+        """Return a zero-filled sample with valid_len=0 so _accumulate skips it."""
+        fpc = self.fpc
+        video = {
+            view: np.zeros(self._cached_frame_shape[view], dtype=np.float32)
+            for view in self.views
+        }
+        return {
+            "video": video,
+            "actions": np.zeros((fpc, plan["fstp"] * self.action_dim), dtype=np.float32),
+            "states": np.zeros((fpc, self.state_dim), dtype=np.float32),
+            "cam_rel_poses": np.zeros((fpc, 21), dtype=np.float32),
+            "frame_indices": np.zeros(fpc, dtype=np.int64),
+            "episode_idx": episode_idx,
+            "start_idx": start_idx,
+            "valid_len": 0,
         }
 
     def loadvideo_decord(self, sample, plan, start_idx=0):
@@ -443,9 +467,16 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         buffers = {}
         for view, vpath in sample["video_paths"].items():
             vr = self._get_video_reader(vpath)
-            buf = vr.get_batch(window_indices).asnumpy()
+            try:
+                buf = vr.get_batch(window_indices).asnumpy()
+            except Exception:
+                # Truncated/corrupt tail: clip to a safe frame limit and retry once.
+                safe_limit = max(0, len(vr) - 16)
+                safe_indices = np.clip(window_indices, 0, safe_limit)
+                buf = vr.get_batch(safe_indices).asnumpy()
             if self.transform is not None:
                 buf = self.transform(buf)
+            self._cached_frame_shape[view] = tuple(buf.shape) if hasattr(buf, "shape") else tuple(buf.size())
             buffers[view] = buf
         return buffers, actions, states, cam_rel_poses, window_indices
 
@@ -916,7 +947,7 @@ class BehaviorEpisodePreencoder:
                 wt.start()
 
                 pbar = tqdm(data_loader, desc="Encoding batches")
-                for batch in pbar:
+                for _batch_idx, batch in enumerate(pbar):
                     if uploader and max_pending_shards is not None:
                         uploader.wait_until_below(max_pending_shards)
                     nv = len(views)
@@ -927,6 +958,12 @@ class BehaviorEpisodePreencoder:
                     batch_size = real_b
                     for b in range(batch_size):
                         self._accumulate(state, dataset, write_queue, tokens_by_view, batch, b)
+                    if _batch_idx % 50 == 0:
+                        gc.collect()
+                        try:
+                            ctypes.CDLL(None).malloc_trim(0)
+                        except OSError:
+                            pass
                 self._flush_active_episode(state)
                 write_queue.put(None)
                 wt.join()
@@ -1059,6 +1096,8 @@ class BehaviorEpisodePreencoder:
             state["active_step_pos"]   = 0
 
         state["active_episode_idx"] = episode_idx
+        if valid_len == 0:
+            return  # corrupted window — step_pos not advanced, gap left in episode
         episode_len = len(dataset.episode_plans[episode_idx]["indices"])
         sample_idx  = int(dataset.episode_plans[episode_idx]["sample_idx"])
 
