@@ -41,8 +41,8 @@ output:
   local_output_dir:
   hf_repo_id: quastAI/behavior2025-vjepa2-vitg-130h-demo-embeddings
   hf_path_prefix: shards_256px_vit_16_g
-  max_shard_bytes: 268435456   # 256 MiB — was 1 GiB; faster commits, smaller blast radius per stall
-  commit_batch_size: 5         # 5 × 256 MiB = 1.25 GiB per commit; completes in ~30s not 30min
+  max_shard_bytes: 536870912   # 512 MiB — standard MDS range; Colab→HF bandwidth is not the bottleneck
+  commit_batch_size: 10        # 10 × 512 MiB = 5 GiB per commit; at 200 shards/hr = 20 commits/hr (well under 128/hr limit)
   num_upload_workers: 4        # S3 parallelism via preupload_lfs_files; commits are serialized
-  max_pending_shards: 10       # truly idle shards (excludes in-flight); tight cap on disk backlog
+  max_pending_shards: 20       # truly idle shards (excludes in-flight); cap on disk backlog
   upload_timeout: 600          # seconds before a stalled socket raises and triggers retry

@@ -139,10 +139,11 @@ Runs schema, episode completeness, action/state alignment, and token shape check
 | `output.local_output_dir` | — | Local directory for MDS shards; leave blank for HF-only mode (shards written to a tmpdir and deleted after upload) |
 | `output.hf_repo_id` | — | Destination HuggingFace dataset repo for MDS shards |
 | `output.hf_path_prefix` | `""` | Path prefix inside the HF repo (e.g. `shards_256px_vit_16_g`) |
-| `output.max_shard_bytes` | `1073741824` | Max shard file size in bytes (default 1 GiB) |
-| `output.commit_batch_size` | `20` | Shards bundled per HF `create_commit` call; keeps total commits well below the 128/hour API limit |
-| `output.num_upload_workers` | `1` | Concurrent HF commit threads; values > 1 hide API round-trip latency when uploads are concurrency-bound |
-| `output.max_pending_shards` | — | Pause encoding when this many shards are waiting on disk (e.g. `40` ≈ 40 GiB at 1 GiB/shard); leave unset to disable backpressure |
+| `output.max_shard_bytes` | `536870912` | Max shard file size in bytes (512 MiB, standard MDS range); Colab→HF S3 bandwidth is not the bottleneck — GPU encoding is |
+| `output.commit_batch_size` | `10` | Shards per HF `create_commit`. HuggingFace enforces **128 commits/hour**; keep `commit_batch_size ≥ ceil(expected_shards_per_hour / 100)` to stay safely under this ceiling (e.g. 10 at 200 shards/hr = 20 commits/hr) |
+| `output.num_upload_workers` | `4` | Threads running concurrent S3 pre-uploads (`preupload_lfs_files`); `create_commit` calls are always serialized internally so workers never conflict on the branch HEAD |
+| `output.max_pending_shards` | — | Pause encoding when this many **idle** (not yet dispatched to a worker) shards are on disk; leave unset to disable backpressure |
+| `output.upload_timeout` | `600` | Seconds before a stalled S3 socket raises and triggers a retry; prevents worker threads hanging forever on flaky connections |
 
 ### `configs/behavior-vjepa21-vitg16-384px-16f.yaml` — encoding (native backend)
 
@@ -191,7 +192,7 @@ Simulator-only global state (absolute position, accumulated odometry) is exclude
 
 **`base_dataset.py` / `base_dataset_utils.py`** — `BaseDataset` loads task/episode metadata from the remote BEHAVIOR-1K HuggingFace repo, samples episodes per task up to the time budget, downloads parquet (actions/states), MP4 (video), and JSON (meta) files locally, then writes `manifest.json`.
 
-**`behavior.py`** — `BehaviorVideoDataset` is a PyTorch `Dataset` that reads the manifest and yields fixed-length clips: loads frames via Decord, extracts the 133-dim proprioceptive state, and returns `{video, actions, states}`. `BehaviorEpisodePreencoder` wraps this with a DataLoader, runs the encoder over full episodes, accumulates tokenized tubelets, writes MDS shards via `MDSWriter`, and concurrently uploads completed shards to HuggingFace via `_ShardUploader` (a background polling thread backed by a `ThreadPoolExecutor` for parallel commits). Backpressure via `max_pending_shards` pauses encoding when uploads fall behind to prevent disk exhaustion.
+**`behavior.py`** — `BehaviorVideoDataset` is a PyTorch `Dataset` that reads the manifest and yields fixed-length clips: loads frames via Decord, extracts the 133-dim proprioceptive state, and returns `{video, actions, states}`. `BehaviorEpisodePreencoder` wraps this with a DataLoader, runs the encoder over full episodes, accumulates tokenized tubelets, writes MDS shards via `MDSWriter`, and concurrently uploads completed shards to HuggingFace via `_ShardUploader`. The uploader runs a background polling thread that dispatches shard batches to a `ThreadPoolExecutor`; each worker calls `preupload_lfs_files` in parallel (concurrent S3 uploads) then acquires a commit lock to serialize `create_commit` calls, preventing HEAD conflicts within the 128 commits/hour HF rate limit. Backpressure via `max_pending_shards` pauses encoding only on truly idle (not yet dispatched) shards to prevent disk exhaustion without blocking on in-flight uploads.
 
 **`encode_behavior_dataset.py`** — `HFVJEPA2Encoder` loads V-JEPA2 via HuggingFace `AutoModel`. `NativeVJEPA21Encoder` loads V-JEPA 2.1 via the native repo factory. Both expose an `encode_frames(video_tensor) → tokens` interface.
 
