@@ -139,6 +139,7 @@ def main(cfg_path: str):
         num_upload_workers=out_cfg.get("num_upload_workers", 1),
         max_pending_shards=out_cfg.get("max_pending_shards"),
         upload_timeout=out_cfg.get("upload_timeout", 600),
+        write_queue_depth=out_cfg.get("write_queue_depth", 256),
     )
 
 

@@ -38,11 +38,12 @@ data_aug:
   reprob: 0.0
 
 output:
-  local_output_dir:
-  hf_repo_id: quastAI/behavior2025-vjepa2-vitg-130h-demo-embeddings
+  local_output_dir: /workspace/shards_256px_vit_16_g
+  hf_repo_id: 
   hf_path_prefix: shards_256px_vit_16_g
   max_shard_bytes: 536870912   # 512 MiB — standard MDS range; Colab→HF bandwidth is not the bottleneck
   commit_batch_size: 10        # 10 × 512 MiB = 5 GiB per commit; at 200 shards/hr = 20 commits/hr (well under 128/hr limit)
   num_upload_workers: 4        # S3 parallelism via preupload_lfs_files; commits are serialized
-  max_pending_shards: 20       # truly idle shards (excludes in-flight); cap on disk backlog
+  max_pending_shards:        # truly idle shards (excludes in-flight); cap on disk backlog
   upload_timeout: 600          # seconds before a stalled socket raises and triggers retry
+  write_queue_depth: 256       # max rows queued between GPU encoder and MDS writer thread (~2 MB/row for multi-view ViT-G)

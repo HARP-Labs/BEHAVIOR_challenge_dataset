@@ -7,6 +7,7 @@ for _name in ("Iterator", "Mapping", "MutableMapping", "Sequence", "MutableSeque
 
 import glob
 import json
+import queue
 import os
 import shutil
 import socket
@@ -799,14 +800,14 @@ class BehaviorEpisodePreencoder:
         return {**token_cols, **BehaviorEpisodePreencoder._MDS_COLUMNS_BASE}
 
     @torch.inference_mode()
-    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, commit_batch_size=20, num_upload_workers=1, max_pending_shards=None, upload_timeout=600):
+    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, commit_batch_size=20, num_upload_workers=1, max_pending_shards=None, upload_timeout=600, write_queue_depth=256):
         """Encode all episodes and write them as MDS shards.
 
         Iterates over ``dataset`` in window order, encodes each batch with the
-        vision encoder, re-assembles the per-frame tokens in episode order, and
-        writes complete episodes to MDS via ``MDSWriter``.  Optionally uploads
-        finished shards to a HuggingFace dataset repository in the background
-        while encoding continues.
+        vision encoder, and streams per-frame tokens to a background writer
+        thread that calls MDSWriter.  Optionally uploads finished shards to a
+        HuggingFace dataset repository in the background while encoding
+        continues.
 
         Args:
             dataset: ``BehaviorVideoDataset`` instance to encode.
@@ -838,6 +839,11 @@ class BehaviorEpisodePreencoder:
                 shards are waiting on disk to be uploaded. Acts as a hard cap
                 on disk usage (``max_pending_shards * max_shard_bytes``).
                 ``None`` disables backpressure (default).
+            write_queue_depth: Maximum number of MDS rows buffered between the
+                GPU encoder and the background writer thread.  The encoder
+                blocks when the queue is full, bounding RAM to
+                ``write_queue_depth * row_size`` regardless of episode length.
+                Defaults to 256.
 
         Raises:
             ValueError: If neither ``output_dir`` nor ``hf_repo_id`` is given.
@@ -864,9 +870,9 @@ class BehaviorEpisodePreencoder:
             "DataLoader must use SequentialSampler (shuffle=False) — episode accumulation requires ordered windows"
         state = {
             "encoded_episodes": 0,
-            "encoded_frames": 0,
+            "encoded_frames":   0,
             "active_episode_idx": None,
-            "active_buffer": None,
+            "active_step_pos":    0,
         }
 
         uploader = None
@@ -887,6 +893,28 @@ class BehaviorEpisodePreencoder:
         mds_columns = self._mds_columns(views)
         try:
             with MDSWriter(out=write_dir, columns=mds_columns, size_limit=max_shard_bytes) as writer:
+                write_queue = queue.Queue(maxsize=write_queue_depth)
+                _writer_exc: list = []
+
+                def _writer_thread_fn():
+                    try:
+                        while True:
+                            item = write_queue.get()
+                            if item is None:
+                                break
+                            writer.write(item)
+                    except Exception as exc:
+                        _writer_exc.append(exc)
+                        # drain so the main thread's blocking put() calls don't deadlock
+                        try:
+                            while True:
+                                write_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+
+                wt = threading.Thread(target=_writer_thread_fn, daemon=True)
+                wt.start()
+
                 pbar = tqdm(data_loader, desc="Encoding batches")
                 for batch in pbar:
                     if uploader and max_pending_shards is not None:
@@ -898,8 +926,12 @@ class BehaviorEpisodePreencoder:
                     tokens_by_view = {view: cat_tokens[i * real_b:(i + 1) * real_b] for i, view in enumerate(views)}
                     batch_size = real_b
                     for b in range(batch_size):
-                        self._accumulate(state, dataset, writer, tokens_by_view, batch, b)
-                self._flush_active_episode(state, dataset, writer)
+                        self._accumulate(state, dataset, write_queue, tokens_by_view, batch, b)
+                self._flush_active_episode(state)
+                write_queue.put(None)
+                wt.join()
+                if _writer_exc:
+                    raise RuntimeError("MDS writer thread failed") from _writer_exc[0]
             # MDSWriter context exit writes the final shard and index.json.
             if uploader:
                 uploader.stop_and_flush()
@@ -909,54 +941,22 @@ class BehaviorEpisodePreencoder:
             if tmp_dir:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _flush_active_episode(self, state, dataset, writer):
-        """Write the buffered windows for the current episode to the MDS writer.
+    def _flush_active_episode(self, state):
+        """Finalise episode counters after all windows have been enqueued.
 
-        Windows are sorted by their ``start_idx`` before concatenation so that
-        the written frame sequence is in chronological order regardless of
-        data-loader ordering.  Clears the active buffer and increments the
-        episode and frame counters in ``state`` afterwards.
+        Rows are written incrementally by ``_accumulate`` so this method only
+        updates the ``encoded_episodes`` / ``encoded_frames`` counters and
+        resets the episode tracking fields.
 
         Args:
-            state: Mutable state dict maintained by ``encode_full_episodes``,
-                containing ``active_episode_idx``, ``active_buffer``,
-                ``encoded_episodes``, and ``encoded_frames``.
-            dataset: The ``BehaviorVideoDataset`` being encoded, used to look
-                up the original ``sample_idx`` for each episode.
-            writer: Open ``MDSWriter`` instance to write samples into.
+            state: Mutable state dict maintained by ``encode_full_episodes``.
         """
-        views = [k[len("tokens_"):] for k in state["active_buffer"] if k.startswith("tokens_")]
-        if state["active_episode_idx"] is None or state["active_buffer"] is None or not views or not state["active_buffer"][f"tokens_{views[0]}"]:
+        if state["active_episode_idx"] is None:
             return
-        buf = state["active_buffer"]
-        order = np.argsort(buf["starts"])
-        episode_idx = int(state["active_episode_idx"])
-        sample_idx  = int(dataset.episode_plans[episode_idx]["sample_idx"])
-        tokens_by_view = {
-            view: np.concatenate([buf[f"tokens_{view}"][i] for i in order], axis=0)
-            for view in views
-        }
-        actions       = np.concatenate([buf["actions"][i]       for i in order], axis=0)
-        states        = np.concatenate([buf["states"][i]        for i in order], axis=0)
-        cam_rel_poses = np.concatenate([buf["cam_rel_poses"][i] for i in order], axis=0)
-        frame_indices = np.concatenate([buf["frame_indices"][i] for i in order], axis=0)
-        T = next(iter(tokens_by_view.values())).shape[0]
-        for t in range(T):
-            writer.write({
-                **{f"tokens_{view}": tokens_by_view[view][t] for view in views},
-                "actions":       actions[t],
-                "states":        states[t],
-                "cam_rel_poses": cam_rel_poses[t],
-                "frame_index":   int(frame_indices[t]),
-                "episode_idx":   episode_idx,
-                "sample_idx":    sample_idx,
-                "step_pos":      t,
-                "episode_len":   T,
-            })
         state["encoded_episodes"] += 1
-        state["encoded_frames"] += T
+        state["encoded_frames"]   += state["active_step_pos"]
         state["active_episode_idx"] = None
-        state["active_buffer"] = None
+        state["active_step_pos"]    = 0
 
     @staticmethod
     def _worker_init_fn(_worker_id):
@@ -1027,22 +1027,22 @@ class BehaviorEpisodePreencoder:
         tokens_per_frame = tokens.shape[1]
         return tokens.reshape(B, T, tokens_per_frame, tokens.shape[2])
 
-    def _accumulate(self, state, dataset, writer, tokens_by_view, batch, b):
-        """Accumulate encoded windows into the active episode buffer.
+    def _accumulate(self, state, dataset, write_queue, tokens_by_view, batch, b):
+        """Write encoded windows for one batch item to the MDS write queue.
 
-        Each frame in the clip window becomes one MDS row.  ``tokens_by_view``
-        contains per-frame token arrays of shape ``(B, fpc, tokens_per_frame,
-        embed_dim)`` as returned by ``_encode_batch``.  Actions, states, and
-        frame indices are stored one entry per sampled frame (``valid_len``
-        entries per clip, trimming end-of-episode padding).
+        Each valid frame in the clip becomes one MDS row enqueued immediately
+        rather than buffered.  Windows arrive in chronological order because
+        the DataLoader uses ``shuffle=False`` with a SequentialSampler and
+        ``_build_window_index`` generates windows in ascending ``start_idx``
+        order, so no end-of-episode sort is needed.
 
-        When the episode index changes, the previous episode is flushed to the
-        MDS writer before starting a new buffer.
+        Episode transitions finalise the counters for the outgoing episode and
+        reset ``active_step_pos`` for the incoming one.
 
         Args:
             state: Mutable state dict maintained by ``encode_full_episodes``.
             dataset: The source ``BehaviorVideoDataset``.
-            writer: Open ``MDSWriter`` instance.
+            write_queue: ``queue.Queue`` consumed by the background writer thread.
             tokens_by_view: Dict mapping view name to encoded token array of
                 shape ``(B, fpc, tokens_per_frame, embed_dim)`` as returned by
                 ``_encode_batch``.
@@ -1052,24 +1052,26 @@ class BehaviorEpisodePreencoder:
         episode_idx = int(batch["episode_idx"][b])
         valid_len   = int(batch["valid_len"][b])
         views = list(tokens_by_view.keys())
-        empty_buffer = {f"tokens_{view}": [] for view in views} | {"actions": [], "states": [], "cam_rel_poses": [], "frame_indices": [], "starts": []}
-        if state["active_episode_idx"] is None:
-            state["active_episode_idx"] = episode_idx
-            state["active_buffer"] = empty_buffer
-        elif episode_idx != state["active_episode_idx"]:
-            self._flush_active_episode(state, dataset, writer)
-            state["active_episode_idx"] = episode_idx
-            state["active_buffer"] = empty_buffer
-        for view in views:
-            state["active_buffer"][f"tokens_{view}"].append(tokens_by_view[view][b, :valid_len])
-        # Actions: one chunk per frame — the fstp raw actions executed FROM frame f
-        # onward (i.e. what the robot does between observation f and f+1).
-        # batch["actions"] has shape (fpc, fstp*action_dim); valid_len trims end-of-episode padding.
-        act = batch["actions"][b]  # (fpc, fstp*action_dim)
-        state["active_buffer"]["actions"].append(act[:valid_len])
-        # States and cam_rel_poses: snapshot AT the frame index (start of each step),
-        # matching the moment each frame's tokens were observed.
-        state["active_buffer"]["states"].append(batch["states"][b, :valid_len])
-        state["active_buffer"]["cam_rel_poses"].append(batch["cam_rel_poses"][b, :valid_len])
-        state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_len])
-        state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
+
+        if state["active_episode_idx"] is not None and episode_idx != state["active_episode_idx"]:
+            state["encoded_episodes"] += 1
+            state["encoded_frames"]   += state["active_step_pos"]
+            state["active_step_pos"]   = 0
+
+        state["active_episode_idx"] = episode_idx
+        episode_len = len(dataset.episode_plans[episode_idx]["indices"])
+        sample_idx  = int(dataset.episode_plans[episode_idx]["sample_idx"])
+
+        for t in range(valid_len):
+            write_queue.put({
+                **{f"tokens_{view}": tokens_by_view[view][b, t] for view in views},
+                "actions":       batch["actions"][b, t],
+                "states":        batch["states"][b, t],
+                "cam_rel_poses": batch["cam_rel_poses"][b, t],
+                "frame_index":   int(batch["frame_indices"][b, t]),
+                "episode_idx":   episode_idx,
+                "sample_idx":    sample_idx,
+                "step_pos":      state["active_step_pos"],
+                "episode_len":   episode_len,
+            })
+            state["active_step_pos"] += 1
