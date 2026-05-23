@@ -9,7 +9,7 @@ model:
 
 data:
   datasets:
-    - /content/base_dataset/manifest.json
+    - /workspace/base_dataset/manifest.json
   dataset_fpcs:
     - 32
   batch_size: 4
@@ -17,7 +17,7 @@ data:
   crop_size: 256
   num_workers: 8
   persistent_workers: true
-  prefetch_factor: 8
+  prefetch_factor: 4
   pin_mem: true
   camera_view: multi  # "head" or "multi" (head + left_wrist + right_wrist)
   action_dim: 23

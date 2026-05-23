@@ -926,6 +926,8 @@ class BehaviorEpisodePreencoder:
             with MDSWriter(out=write_dir, columns=mds_columns, size_limit=max_shard_bytes) as writer:
                 write_queue = queue.Queue(maxsize=write_queue_depth)
                 _writer_exc: list = []
+                _writer_alive = threading.Event()
+                _writer_alive.set()
 
                 def _writer_thread_fn():
                     try:
@@ -936,7 +938,11 @@ class BehaviorEpisodePreencoder:
                             writer.write(item)
                     except Exception as exc:
                         _writer_exc.append(exc)
-                        # drain so the main thread's blocking put() calls don't deadlock
+                    finally:
+                        # Clear the liveness flag BEFORE draining so the main thread's
+                        # put-with-timeout loop sees the dead flag and raises rather than
+                        # refilling the queue with no consumer (which would deadlock).
+                        _writer_alive.clear()
                         try:
                             while True:
                                 write_queue.get_nowait()
@@ -952,12 +958,17 @@ class BehaviorEpisodePreencoder:
                         uploader.wait_until_below(max_pending_shards)
                     nv = len(views)
                     cat_video = torch.cat([batch["video"][view] for view in views], dim=0)
+                    del batch["video"]  # encoded form goes into cat_tokens; free 302 MB pinned now
                     cat_tokens = self._encode_batch(cat_video, self.temporal_patch_size)
+                    del cat_video       # GPU encode done; free 302 MB CPU tensor immediately
                     real_b = cat_tokens.shape[0] // nv
                     tokens_by_view = {view: cat_tokens[i * real_b:(i + 1) * real_b] for i, view in enumerate(views)}
+                    del cat_tokens      # views in tokens_by_view keep the buffer alive until del below
                     batch_size = real_b
                     for b in range(batch_size):
-                        self._accumulate(state, dataset, write_queue, tokens_by_view, batch, b)
+                        self._accumulate(state, dataset, write_queue, tokens_by_view, batch, b,
+                                         _writer_alive)
+                    del tokens_by_view  # queue holds .copy()s so the cat_tokens buffer is freed here
                     if _batch_idx % 50 == 0:
                         gc.collect()
                         try:
@@ -1064,7 +1075,7 @@ class BehaviorEpisodePreencoder:
         tokens_per_frame = tokens.shape[1]
         return tokens.reshape(B, T, tokens_per_frame, tokens.shape[2])
 
-    def _accumulate(self, state, dataset, write_queue, tokens_by_view, batch, b):
+    def _accumulate(self, state, dataset, write_queue, tokens_by_view, batch, b, writer_alive):
         """Write encoded windows for one batch item to the MDS write queue.
 
         Each valid frame in the clip becomes one MDS row enqueued immediately
@@ -1085,6 +1096,9 @@ class BehaviorEpisodePreencoder:
                 ``_encode_batch``.
             batch: Collated batch dict from the data loader.
             b: Batch index of the sample to accumulate.
+            writer_alive: ``threading.Event`` that is cleared when the writer
+                thread exits.  Used to detect writer death and raise rather than
+                block forever on a full queue with no consumer.
         """
         episode_idx = int(batch["episode_idx"][b])
         valid_len   = int(batch["valid_len"][b])
@@ -1102,15 +1116,22 @@ class BehaviorEpisodePreencoder:
         sample_idx  = int(dataset.episode_plans[episode_idx]["sample_idx"])
 
         for t in range(valid_len):
-            write_queue.put({
-                **{f"tokens_{view}": tokens_by_view[view][b, t] for view in views},
-                "actions":       batch["actions"][b, t],
-                "states":        batch["states"][b, t],
-                "cam_rel_poses": batch["cam_rel_poses"][b, t],
+            row = {
+                **{f"tokens_{view}": tokens_by_view[view][b, t].copy() for view in views},
+                "actions":       batch["actions"][b, t].copy(),
+                "states":        batch["states"][b, t].copy(),
+                "cam_rel_poses": batch["cam_rel_poses"][b, t].copy(),
                 "frame_index":   int(batch["frame_indices"][b, t]),
                 "episode_idx":   episode_idx,
                 "sample_idx":    sample_idx,
                 "step_pos":      state["active_step_pos"],
                 "episode_len":   episode_len,
-            })
+            }
+            while True:
+                try:
+                    write_queue.put(row, timeout=1.0)
+                    break
+                except queue.Full:
+                    if not writer_alive.is_set():
+                        raise RuntimeError("MDS writer thread died unexpectedly")
             state["active_step_pos"] += 1
