@@ -5,15 +5,19 @@ for _name in ("Iterator", "Mapping", "MutableMapping", "Sequence", "MutableSeque
     if not hasattr(collections, _name):
         setattr(collections, _name, getattr(collections.abc, _name))
 
+import ctypes
+import gc
 import glob
 import json
+import queue
 import os
 import shutil
-import subprocess
+import socket
 import tempfile
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from logging import getLogger
 from math import ceil
 from tqdm import tqdm
@@ -28,7 +32,7 @@ import pandas as pd
 import torch
 import torch.utils.data
 from decord import VideoReader, cpu
-from huggingface_hub import HfApi
+from huggingface_hub import CommitOperationAdd, HfApi
 
 logger = getLogger()
 
@@ -84,6 +88,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         action_dim=23,
         cache_parquet=False,
         cache_video_readers=False,
+        cache_max_entries=12,
     ):
         """Initialize the dataset from a JSON manifest file.
 
@@ -101,6 +106,10 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 repeated disk reads across workers.
             cache_video_readers: If True, keep ``VideoReader`` objects alive
                 between calls to ``loadvideo_decord``.
+            cache_max_entries: Maximum number of entries kept in each per-worker
+                cache dict. When the limit is reached the oldest entry is evicted
+                (FIFO). Default of 12 covers ~4 episodes x 3 views per worker
+                without unbounded RAM growth.
         """
         if camera_view not in self.CAMERA_VIEWS:
             raise ValueError(f"camera_view must be one of {list(self.CAMERA_VIEWS)}. Got: {camera_view!r}")
@@ -115,8 +124,10 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self.action_dim = action_dim
         self.cache_parquet = cache_parquet
         self.cache_video_readers = cache_video_readers
+        self._cache_max_entries = cache_max_entries
         self._parquet_cache = {}
         self._video_reader_cache = {}
+        self._cached_frame_shape: dict = {}  # view → shape, populated on first successful decode
 
         manifest = self._load_manifest(data_path)
         self.samples = self._parse_samples(manifest)
@@ -230,7 +241,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         # Use the first view's video to determine FPS and length.
         vpath = next(iter(sample["video_paths"].values()))
         ppath = sample["parquet_path"]
-        vr = VideoReader(vpath, num_threads=1, ctx=cpu(0))
+        vr = VideoReader(vpath, num_threads=2, ctx=cpu(0))
         try:
             vfps = vr.get_avg_fps()
             vlen = len(vr)
@@ -312,6 +323,9 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             except Exception as e:
                 logger.warning(f"Attempt {attempt+1}/{max_retries} failed for sample={sample} {e=}")
                 if attempt == max_retries - 1:
+                    if all(v in self._cached_frame_shape for v in self.views):
+                        logger.warning(f"Returning skip sentinel for {sample}")
+                        return self._make_skip_sample(episode_idx, start_idx, plan)
                     raise
 
         valid_len = min(self.fpc, len(plan["indices"]) - start_idx)
@@ -324,6 +338,24 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             "episode_idx": episode_idx,
             "start_idx": start_idx,
             "valid_len": valid_len,
+        }
+
+    def _make_skip_sample(self, episode_idx: int, start_idx: int, plan: dict) -> dict:
+        """Return a zero-filled sample with valid_len=0 so _accumulate skips it."""
+        fpc = self.fpc
+        video = {
+            view: np.zeros(self._cached_frame_shape[view], dtype=np.float32)
+            for view in self.views
+        }
+        return {
+            "video": video,
+            "actions": np.zeros((fpc, plan["fstp"] * self.action_dim), dtype=np.float32),
+            "states": np.zeros((fpc, self.state_dim), dtype=np.float32),
+            "cam_rel_poses": np.zeros((fpc, 21), dtype=np.float32),
+            "frame_indices": np.zeros(fpc, dtype=np.int64),
+            "episode_idx": episode_idx,
+            "start_idx": start_idx,
+            "valid_len": 0,
         }
 
     def loadvideo_decord(self, sample, plan, start_idx=0):
@@ -379,9 +411,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             )
 
         states = self._extract_proprio(full_states)
-        first_vr = self._get_video_reader(first_vpath)
         fstp = plan["fstp"]
-        max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0], len(first_vr))
+        max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0])
         indices = plan["indices"]
 
         if len(indices) == 0:
@@ -436,9 +467,16 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         buffers = {}
         for view, vpath in sample["video_paths"].items():
             vr = self._get_video_reader(vpath)
-            buf = vr.get_batch(window_indices).asnumpy()
+            try:
+                buf = vr.get_batch(window_indices).asnumpy()
+            except Exception:
+                # Truncated/corrupt tail: clip to a safe frame limit and retry once.
+                safe_limit = max(0, len(vr) - 16)
+                safe_indices = np.clip(window_indices, 0, safe_limit)
+                buf = vr.get_batch(safe_indices).asnumpy()
             if self.transform is not None:
                 buf = self.transform(buf)
+            self._cached_frame_shape[view] = tuple(buf.shape)
             buffers[view] = buf
         return buffers, actions, states, cam_rel_poses, window_indices
 
@@ -456,6 +494,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         cached = self._parquet_cache.get(ppath)
         if cached is not None:
             return cached
+        if len(self._parquet_cache) >= self._cache_max_entries:
+            self._parquet_cache.pop(next(iter(self._parquet_cache)))
         df = pd.read_parquet(ppath)
         self._parquet_cache[ppath] = df
         return df
@@ -470,43 +510,50 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             ``decord.VideoReader`` instance for the requested file.
         """
         if not self.cache_video_readers:
-            return VideoReader(vpath, num_threads=1, ctx=cpu(0))
+            return VideoReader(vpath, num_threads=2, ctx=cpu(0))
         cached = self._video_reader_cache.get(vpath)
         if cached is not None:
             return cached
-        vr = VideoReader(vpath, num_threads=1, ctx=cpu(0))
+        if len(self._video_reader_cache) >= self._cache_max_entries:
+            self._video_reader_cache.pop(next(iter(self._video_reader_cache)))
+        vr = VideoReader(vpath, num_threads=2, ctx=cpu(0))
         self._video_reader_cache[vpath] = vr
         return vr
 
 class _ShardUploader:
-    """Uploads completed MDS shards to HF in a background thread.
+    """Uploads completed MDS shards to HF using batched commits.
 
-    Polls write_dir every 30 s for new shard.*.mds files.  All but the last
-    shard are considered complete and safe to upload (the last one may still
-    be open by MDSWriter).  call stop_and_flush() after MDSWriter exits to
-    drain remaining shards and index.json.
+    Polls write_dir every ``poll_interval`` seconds for new shard.*.mds files.
+    All but the last shard are considered complete and safe to upload (the last
+    one may still be open by MDSWriter).  Call stop_and_flush() after MDSWriter
+    exits to drain remaining shards; index.json is always uploaded last so HF
+    readers never observe a manifest that references missing shards.
 
     When delete_local=True (HF-only mode), each shard is removed from disk
-    immediately after a successful upload to keep disk usage bounded.
+    immediately after a successful batch commit to keep disk usage bounded.
+
+    Batching: ``commit_batch_size`` shards are accumulated and pushed in a single
+    ``create_commit`` call, keeping the total number of HF commits well below the
+    128-per-hour API rate limit.
     """
 
-    def __init__(self, write_dir, api, repo_id, path_in_repo, delete_local):
-        """Initialize the uploader but do not start the background thread yet.
-
-        Args:
-            write_dir: Local directory that ``MDSWriter`` writes shards into.
-            api: Authenticated ``huggingface_hub.HfApi`` instance.
-            repo_id: HuggingFace dataset repository ID (e.g. ``"org/repo"``).
-            path_in_repo: Prefix path inside the repository for all uploaded
-                files.  Pass ``None`` or an empty string for the repo root.
-            delete_local: If True, each shard is removed from disk immediately
-                after a successful upload.
-        """
-        self._write_dir    = write_dir
-        self._api          = api
-        self._repo_id      = repo_id
-        self._path_in_repo = path_in_repo
-        self._delete_local = delete_local
+    def __init__(self, write_dir, api, repo_id, path_in_repo, delete_local,
+                 commit_batch_size=20, poll_interval=5, num_upload_workers=1,
+                 upload_timeout=600):
+        self._write_dir         = write_dir
+        self._api               = api
+        self._repo_id           = repo_id
+        self._path_in_repo      = path_in_repo
+        self._delete_local      = delete_local
+        self._commit_batch_size = commit_batch_size
+        self._poll_interval     = poll_interval
+        self._upload_timeout    = upload_timeout
+        # hf_transfer: Rust-backed upload chunking — 2-5× faster when installed.
+        try:
+            import hf_transfer as _  # noqa: F401
+            os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        except ImportError:
+            pass
         try:
             import huggingface_hub.utils as _hf_utils
             import huggingface_hub.utils.logging as _hf_logging
@@ -514,78 +561,156 @@ class _ShardUploader:
             _hf_logging.set_verbosity_error()
         except Exception:
             pass
-        self._uploaded     = set()
-        self._error        = None
-        self._stop         = threading.Event()
-        self._thread       = threading.Thread(target=self._loop, daemon=True)
+        self._uploaded    = set()
+        self._in_flight   = set()
+        self._lock        = threading.Lock()
+        self._commit_lock = threading.Lock()
+        self._futures     = []
+        self._executor    = ThreadPoolExecutor(max_workers=num_upload_workers)
+        self._stop        = threading.Event()
+        self._thread      = threading.Thread(target=self._loop, daemon=True)
+        # Bound all socket I/O in this process (incl. S3 PUT reads) so stalled
+        # connections raise socket.timeout rather than hanging forever.
+        socket.setdefaulttimeout(upload_timeout)
 
     def start(self):
-        """Start the background polling thread."""
         self._thread.start()
 
-    def stop_and_flush(self):
-        """Signal the thread to stop, wait for it, then upload remaining files.
+    def stop_and_flush(self, max_flush_retries: int = 3):
+        """Stop polling, retry all failed shards, then commit index.json last.
 
-        Should be called after ``MDSWriter`` has exited so that the final shard
-        and ``index.json`` are complete and safe to upload.
-
-        Raises:
-            RuntimeError: If the background thread encountered an unhandled
-                exception during uploading.
+        Drains in-flight futures (socket timeout bounds each one), retries any
+        batches that failed, then verifies every shard is in _uploaded before
+        committing index.json.  If shards cannot be uploaded after
+        max_flush_retries the repo is left without index.json and an error is
+        logged — a missing manifest is preferable to one referencing absent shards.
         """
         self._stop.set()
         self._thread.join()
-        if self._error:
-            raise RuntimeError("Background shard upload failed") from self._error
-        self._process(final=True)
+        # Drain in-flight batches; socket.setdefaulttimeout bounds each attempt.
+        for f in self._futures:
+            try:
+                f.result()
+            except Exception as e:
+                logger.warning(f"Upload batch failed, scheduling retry: {e}")
+        self._futures.clear()
+        # Retry loop: _commit_files except-block already cleaned up _in_flight for
+        # failed batches, so _commit_pending picks those shards up as eligible again.
+        for attempt in range(max_flush_retries):
+            self._commit_pending(all_shards=True)
+            if not self._futures:
+                break
+            for f in self._futures:
+                try:
+                    f.result()
+                except Exception as e:
+                    logger.warning(f"Flush retry {attempt + 1}/{max_flush_retries} failed: {e}")
+            self._futures.clear()
+        self._executor.shutdown(wait=True)
+        # Verify every shard on disk is confirmed uploaded before touching index.json.
+        remaining = [
+            s for s in glob.glob(os.path.join(self._write_dir, "shard.*.mds"))
+            if s not in self._uploaded
+        ]
+        if remaining:
+            logger.error(
+                f"{len(remaining)} shard(s) could not be uploaded after "
+                f"{max_flush_retries} retries — skipping index.json to avoid a "
+                f"broken manifest. Missing: {remaining}"
+            )
+            return
+        index = os.path.join(self._write_dir, "index.json")
+        if os.path.exists(index) and index not in self._uploaded:
+            self._commit_files([index])
 
     def _loop(self):
-        """Background thread body: poll for new shards every 30 seconds."""
-        try:
-            while not self._stop.wait(timeout=30):
-                self._process(final=False)
-        except Exception as e:
-            self._error = e
+        while not self._stop.wait(timeout=self._poll_interval):
+            self._commit_pending(all_shards=False)
 
-    def _process(self, final):
-        """Upload any not-yet-uploaded shards (and optionally ``index.json``).
+    def _commit_pending(self, all_shards):
+        """Commit not-yet-uploaded shards in batches of commit_batch_size.
 
-        When ``final`` is False the last shard is skipped because
-        ``MDSWriter`` may still be writing to it.  When ``final`` is True all
-        shards and ``index.json`` are included.  Each file is retried up to
-        three times with back-off on failure.
-
-        Args:
-            final: If True, include the last shard and ``index.json``.
+        During polling (all_shards=False) only full batches are committed so
+        shards accumulate to the target batch size before a commit is made.
+        On flush (all_shards=True) any remaining partial batch is committed too.
+        Batches are submitted to the thread-pool executor for concurrent uploads.
         """
+        self._futures = [f for f in self._futures if not f.done()]
         shards = sorted(glob.glob(os.path.join(self._write_dir, "shard.*.mds")))
-        # Skip the last shard unless final — MDSWriter may still be writing to it.
-        targets = shards if final else shards[:-1]
-        if final:
-            index = os.path.join(self._write_dir, "index.json")
-            if os.path.exists(index):
-                targets = targets + [index]
-        for fpath in targets:
-            if fpath in self._uploaded:
-                continue
+        with self._lock:
+            pending = [f for f in (shards if all_shards else shards[:-1])
+                       if f not in self._uploaded and f not in self._in_flight]
+        if not all_shards:
+            # Trim to the largest multiple of batch size so partial batches wait.
+            pending = pending[:len(pending) - len(pending) % self._commit_batch_size]
+        for i in range(0, len(pending), self._commit_batch_size):
+            batch = pending[i:i + self._commit_batch_size]
+            with self._lock:
+                self._in_flight.update(batch)
+            self._futures.append(self._executor.submit(self._commit_files, batch))
+
+    def _commit_files(self, fpaths):
+        """Upload fpaths to HF LFS then create a single serialized commit.
+
+        Phase A (preupload_lfs_files) runs concurrently across workers — this is
+        the slow S3 upload step and benefits from parallelism.  Phase B
+        (create_commit) is serialized via _commit_lock so workers never race on
+        the same branch HEAD and produce 409 conflicts.
+        preupload_lfs_files is a no-op for small files (e.g. index.json) that
+        fall below the LFS threshold, so this method works for all file types.
+        """
+        ops = []
+        for fpath in fpaths:
             fname   = os.path.basename(fpath)
             in_repo = f"{self._path_in_repo}/{fname}" if self._path_in_repo else fname
-            for attempt in range(3):
-                try:
-                    self._api.upload_file(
-                        path_or_fileobj=fpath,
-                        path_in_repo=in_repo,
-                        repo_id=self._repo_id,
-                        repo_type="dataset",
-                    )
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    time.sleep(5 * (attempt + 1))
-            self._uploaded.add(fpath)
-            if self._delete_local and fpath.endswith(".mds"):
-                os.remove(fpath)
+            ops.append(CommitOperationAdd(path_in_repo=in_repo, path_or_fileobj=fpath))
+        try:
+            # Phase A: upload bytes to S3/LFS — parallel, no lock needed.
+            self._api.preupload_lfs_files(
+                repo_id=self._repo_id,
+                repo_type="dataset",
+                additions=ops,
+            )
+            # Phase B: commit — serialized to avoid HEAD conflicts.
+            with self._commit_lock:
+                for attempt in range(3):
+                    try:
+                        self._api.create_commit(
+                            repo_id=self._repo_id,
+                            repo_type="dataset",
+                            operations=ops,
+                            commit_message=f"Upload {len(fpaths)} shard(s)",
+                        )
+                        break
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                        time.sleep(2 * (attempt + 1))
+            with self._lock:
+                self._uploaded.update(fpaths)
+                self._in_flight.difference_update(fpaths)
+        except Exception:
+            with self._lock:
+                self._in_flight.difference_update(fpaths)
+            raise
+        if self._delete_local:
+            for fpath in fpaths:
+                if fpath.endswith(".mds"):
+                    try:
+                        os.remove(fpath)
+                    except FileNotFoundError:
+                        pass
+
+    def pending_count(self) -> int:
+        """Number of shard files on disk not yet dispatched to an upload worker."""
+        shards = glob.glob(os.path.join(self._write_dir, "shard.*.mds"))
+        with self._lock:
+            return len([s for s in shards if s not in self._uploaded and s not in self._in_flight])
+
+    def wait_until_below(self, threshold: int, check_interval: float = 10.0):
+        """Block until fewer than ``threshold`` shards are pending upload."""
+        while self.pending_count() >= threshold:
+            time.sleep(check_interval)
 
 
 class BehaviorEpisodePreencoder:
@@ -684,28 +809,6 @@ class BehaviorEpisodePreencoder:
             "valid_len": np.asarray([item["valid_len"] for item in batch], dtype=np.int64),
         }
 
-    @staticmethod
-    def _gpu_status():
-        """Return a short GPU utilisation string from ``nvidia-smi``.
-
-        Returns:
-            String of the form ``"gpu=<util>% mem=<used>/<total>MB"``, or
-            ``"gpu=n/a"`` if ``nvidia-smi`` is unavailable.
-        """
-        try:
-            out = subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=utilization.gpu,memory.used,memory.total",
-                    "--format=csv,noheader,nounits",
-                ],
-                stderr=subprocess.DEVNULL,
-            ).decode().strip().splitlines()[0]
-            util, mem_used, mem_total = [x.strip() for x in out.split(",")]
-            return f"gpu={util}% mem={mem_used}/{mem_total}MB"
-        except Exception:
-            return "gpu=n/a"
-
     _MDS_COLUMNS_BASE = {
         "actions":       "ndarray",  # (fstp * action_dim,) — raw actions from frame f to frame f+1
         "states":        "ndarray",  # (state_dim,) — robot state at frame f
@@ -728,14 +831,14 @@ class BehaviorEpisodePreencoder:
         return {**token_cols, **BehaviorEpisodePreencoder._MDS_COLUMNS_BASE}
 
     @torch.inference_mode()
-    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4):
+    def encode_full_episodes(self, dataset, output_dir=None, hf_repo_id=None, hf_path_prefix="", max_shard_bytes=1 << 30, batch_size=1, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4, commit_batch_size=20, num_upload_workers=1, max_pending_shards=None, upload_timeout=600, write_queue_depth=256):
         """Encode all episodes and write them as MDS shards.
 
         Iterates over ``dataset`` in window order, encodes each batch with the
-        vision encoder, re-assembles the per-frame tokens in episode order, and
-        writes complete episodes to MDS via ``MDSWriter``.  Optionally uploads
-        finished shards to a HuggingFace dataset repository in the background
-        while encoding continues.
+        vision encoder, and streams per-frame tokens to a background writer
+        thread that calls MDSWriter.  Optionally uploads finished shards to a
+        HuggingFace dataset repository in the background while encoding
+        continues.
 
         Args:
             dataset: ``BehaviorVideoDataset`` instance to encode.
@@ -755,10 +858,26 @@ class BehaviorEpisodePreencoder:
             persistent_workers: If True, keep data-loader worker processes
                 alive between batches.
             prefetch_factor: Number of batches to prefetch per worker.
+            commit_batch_size: Number of shards bundled into each HF commit.
+                Higher values mean fewer commits (avoids the 128/hour rate
+                limit) at the cost of holding more shards on disk at once.
+                Defaults to 20.
+            num_upload_workers: Number of threads submitting concurrent HF
+                commits. Values > 1 hide API round-trip latency and improve
+                upload throughput when the bottleneck is API concurrency rather
+                than raw bandwidth. Defaults to 1.
+            max_pending_shards: If set, pause encoding whenever this many
+                shards are waiting on disk to be uploaded. Acts as a hard cap
+                on disk usage (``max_pending_shards * max_shard_bytes``).
+                ``None`` disables backpressure (default).
+            write_queue_depth: Maximum number of MDS rows buffered between the
+                GPU encoder and the background writer thread.  The encoder
+                blocks when the queue is full, bounding RAM to
+                ``write_queue_depth * row_size`` regardless of episode length.
+                Defaults to 256.
 
         Raises:
             ValueError: If neither ``output_dir`` nor ``hf_repo_id`` is given.
-            RuntimeError: If the background shard uploader fails.
         """
         if not output_dir and not hf_repo_id:
             raise ValueError("Either output_dir or hf_repo_id must be provided")
@@ -782,9 +901,9 @@ class BehaviorEpisodePreencoder:
             "DataLoader must use SequentialSampler (shuffle=False) — episode accumulation requires ordered windows"
         state = {
             "encoded_episodes": 0,
-            "encoded_frames": 0,
+            "encoded_frames":   0,
             "active_episode_idx": None,
-            "active_buffer": None,
+            "active_step_pos":    0,
         }
 
         uploader = None
@@ -795,6 +914,9 @@ class BehaviorEpisodePreencoder:
                 repo_id=hf_repo_id,
                 path_in_repo=hf_path_prefix.strip("/") or None,
                 delete_local=(tmp_dir is not None),
+                commit_batch_size=commit_batch_size,
+                num_upload_workers=num_upload_workers,
+                upload_timeout=upload_timeout,
             )
             uploader.start()
 
@@ -802,18 +924,62 @@ class BehaviorEpisodePreencoder:
         mds_columns = self._mds_columns(views)
         try:
             with MDSWriter(out=write_dir, columns=mds_columns, size_limit=max_shard_bytes) as writer:
+                write_queue = queue.Queue(maxsize=write_queue_depth)
+                _writer_exc: list = []
+                _writer_alive = threading.Event()
+                _writer_alive.set()
+
+                def _writer_thread_fn():
+                    try:
+                        while True:
+                            item = write_queue.get()
+                            if item is None:
+                                break
+                            writer.write(item)
+                    except Exception as exc:
+                        _writer_exc.append(exc)
+                    finally:
+                        # Clear the liveness flag BEFORE draining so the main thread's
+                        # put-with-timeout loop sees the dead flag and raises rather than
+                        # refilling the queue with no consumer (which would deadlock).
+                        _writer_alive.clear()
+                        try:
+                            while True:
+                                write_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+
+                wt = threading.Thread(target=_writer_thread_fn, daemon=True)
+                wt.start()
+
                 pbar = tqdm(data_loader, desc="Encoding batches")
-                for batch_idx, batch in enumerate(pbar):
-                    if batch_idx % 10 == 0:
-                        pbar.set_postfix_str(self._gpu_status())
-                    tokens_by_view = {
-                        view: self._encode_batch(batch["video"][view],self.temporal_patch_size)
-                        for view in views
-                    }
-                    batch_size = next(iter(tokens_by_view.values())).shape[0]
+                for _batch_idx, batch in enumerate(pbar):
+                    if uploader and max_pending_shards is not None:
+                        uploader.wait_until_below(max_pending_shards)
+                    nv = len(views)
+                    cat_video = torch.cat([batch["video"][view] for view in views], dim=0)
+                    del batch["video"]  # encoded form goes into cat_tokens; free 302 MB pinned now
+                    cat_tokens = self._encode_batch(cat_video, self.temporal_patch_size)
+                    del cat_video       # GPU encode done; free 302 MB CPU tensor immediately
+                    real_b = cat_tokens.shape[0] // nv
+                    tokens_by_view = {view: cat_tokens[i * real_b:(i + 1) * real_b] for i, view in enumerate(views)}
+                    del cat_tokens      # views in tokens_by_view keep the buffer alive until del below
+                    batch_size = real_b
                     for b in range(batch_size):
-                        self._accumulate(state, dataset, writer, tokens_by_view, batch, b)
-                self._flush_active_episode(state, dataset, writer)
+                        self._accumulate(state, dataset, write_queue, tokens_by_view, batch, b,
+                                         _writer_alive)
+                    del tokens_by_view  # queue holds .copy()s so the cat_tokens buffer is freed here
+                    if _batch_idx % 50 == 0:
+                        gc.collect()
+                        try:
+                            ctypes.CDLL(None).malloc_trim(0)
+                        except OSError:
+                            pass
+                self._flush_active_episode(state)
+                write_queue.put(None)
+                wt.join()
+                if _writer_exc:
+                    raise RuntimeError("MDS writer thread failed") from _writer_exc[0]
             # MDSWriter context exit writes the final shard and index.json.
             if uploader:
                 uploader.stop_and_flush()
@@ -823,54 +989,22 @@ class BehaviorEpisodePreencoder:
             if tmp_dir:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _flush_active_episode(self, state, dataset, writer):
-        """Write the buffered windows for the current episode to the MDS writer.
+    def _flush_active_episode(self, state):
+        """Finalise episode counters after all windows have been enqueued.
 
-        Windows are sorted by their ``start_idx`` before concatenation so that
-        the written frame sequence is in chronological order regardless of
-        data-loader ordering.  Clears the active buffer and increments the
-        episode and frame counters in ``state`` afterwards.
+        Rows are written incrementally by ``_accumulate`` so this method only
+        updates the ``encoded_episodes`` / ``encoded_frames`` counters and
+        resets the episode tracking fields.
 
         Args:
-            state: Mutable state dict maintained by ``encode_full_episodes``,
-                containing ``active_episode_idx``, ``active_buffer``,
-                ``encoded_episodes``, and ``encoded_frames``.
-            dataset: The ``BehaviorVideoDataset`` being encoded, used to look
-                up the original ``sample_idx`` for each episode.
-            writer: Open ``MDSWriter`` instance to write samples into.
+            state: Mutable state dict maintained by ``encode_full_episodes``.
         """
-        views = [k[len("tokens_"):] for k in state["active_buffer"] if k.startswith("tokens_")]
-        if state["active_episode_idx"] is None or state["active_buffer"] is None or not views or not state["active_buffer"][f"tokens_{views[0]}"]:
+        if state["active_episode_idx"] is None:
             return
-        buf = state["active_buffer"]
-        order = np.argsort(buf["starts"])
-        episode_idx = int(state["active_episode_idx"])
-        sample_idx  = int(dataset.episode_plans[episode_idx]["sample_idx"])
-        tokens_by_view = {
-            view: np.concatenate([buf[f"tokens_{view}"][i] for i in order], axis=0)
-            for view in views
-        }
-        actions       = np.concatenate([buf["actions"][i]       for i in order], axis=0)
-        states        = np.concatenate([buf["states"][i]        for i in order], axis=0)
-        cam_rel_poses = np.concatenate([buf["cam_rel_poses"][i] for i in order], axis=0)
-        frame_indices = np.concatenate([buf["frame_indices"][i] for i in order], axis=0)
-        T = next(iter(tokens_by_view.values())).shape[0]
-        for t in range(T):
-            writer.write({
-                **{f"tokens_{view}": tokens_by_view[view][t] for view in views},
-                "actions":       actions[t],
-                "states":        states[t],
-                "cam_rel_poses": cam_rel_poses[t],
-                "frame_index":   int(frame_indices[t]),
-                "episode_idx":   episode_idx,
-                "sample_idx":    sample_idx,
-                "step_pos":      t,
-                "episode_len":   T,
-            })
         state["encoded_episodes"] += 1
-        state["encoded_frames"] += T
+        state["encoded_frames"]   += state["active_step_pos"]
         state["active_episode_idx"] = None
-        state["active_buffer"] = None
+        state["active_step_pos"]    = 0
 
     @staticmethod
     def _worker_init_fn(_worker_id):
@@ -931,7 +1065,7 @@ class BehaviorEpisodePreencoder:
         # Encode each frame independently: flatten batch and time, duplicate
         # each frame to satisfy the encoder's tubelet_size expectation.
         v = v.permute(0, 2, 1, 3, 4).reshape(B * T, C, 1, H, W)  # [B*T, C, 1, H, W]
-        v = v.expand(-1, -1, temporal_patch_size, -1, -1).contiguous() # [B*T, C, tps, H, W]
+        v = v.repeat(1, 1, temporal_patch_size, 1, 1)  # [B*T, C, tps, H, W]
         tokens = self.encoder(v)
         if isinstance(tokens, (tuple, list)):
             tokens = tokens[0]
@@ -941,49 +1075,63 @@ class BehaviorEpisodePreencoder:
         tokens_per_frame = tokens.shape[1]
         return tokens.reshape(B, T, tokens_per_frame, tokens.shape[2])
 
-    def _accumulate(self, state, dataset, writer, tokens_by_view, batch, b):
-        """Accumulate encoded windows into the active episode buffer.
+    def _accumulate(self, state, dataset, write_queue, tokens_by_view, batch, b, writer_alive):
+        """Write encoded windows for one batch item to the MDS write queue.
 
-        Each frame in the clip window becomes one MDS row.  ``tokens_by_view``
-        contains per-frame token arrays of shape ``(B, fpc, tokens_per_frame,
-        embed_dim)`` as returned by ``_encode_batch``.  Actions, states, and
-        frame indices are stored one entry per sampled frame (``valid_len``
-        entries per clip, trimming end-of-episode padding).
+        Each valid frame in the clip becomes one MDS row enqueued immediately
+        rather than buffered.  Windows arrive in chronological order because
+        the DataLoader uses ``shuffle=False`` with a SequentialSampler and
+        ``_build_window_index`` generates windows in ascending ``start_idx``
+        order, so no end-of-episode sort is needed.
 
-        When the episode index changes, the previous episode is flushed to the
-        MDS writer before starting a new buffer.
+        Episode transitions finalise the counters for the outgoing episode and
+        reset ``active_step_pos`` for the incoming one.
 
         Args:
             state: Mutable state dict maintained by ``encode_full_episodes``.
             dataset: The source ``BehaviorVideoDataset``.
-            writer: Open ``MDSWriter`` instance.
+            write_queue: ``queue.Queue`` consumed by the background writer thread.
             tokens_by_view: Dict mapping view name to encoded token array of
                 shape ``(B, fpc, tokens_per_frame, embed_dim)`` as returned by
                 ``_encode_batch``.
             batch: Collated batch dict from the data loader.
             b: Batch index of the sample to accumulate.
+            writer_alive: ``threading.Event`` that is cleared when the writer
+                thread exits.  Used to detect writer death and raise rather than
+                block forever on a full queue with no consumer.
         """
         episode_idx = int(batch["episode_idx"][b])
         valid_len   = int(batch["valid_len"][b])
         views = list(tokens_by_view.keys())
-        empty_buffer = {f"tokens_{view}": [] for view in views} | {"actions": [], "states": [], "cam_rel_poses": [], "frame_indices": [], "starts": []}
-        if state["active_episode_idx"] is None:
-            state["active_episode_idx"] = episode_idx
-            state["active_buffer"] = empty_buffer
-        elif episode_idx != state["active_episode_idx"]:
-            self._flush_active_episode(state, dataset, writer)
-            state["active_episode_idx"] = episode_idx
-            state["active_buffer"] = empty_buffer
-        for view in views:
-            state["active_buffer"][f"tokens_{view}"].append(tokens_by_view[view][b, :valid_len])
-        # Actions: one chunk per frame — the fstp raw actions executed FROM frame f
-        # onward (i.e. what the robot does between observation f and f+1).
-        # batch["actions"] has shape (fpc, fstp*action_dim); valid_len trims end-of-episode padding.
-        act = batch["actions"][b]  # (fpc, fstp*action_dim)
-        state["active_buffer"]["actions"].append(act[:valid_len])
-        # States and cam_rel_poses: snapshot AT the frame index (start of each step),
-        # matching the moment each frame's tokens were observed.
-        state["active_buffer"]["states"].append(batch["states"][b, :valid_len])
-        state["active_buffer"]["cam_rel_poses"].append(batch["cam_rel_poses"][b, :valid_len])
-        state["active_buffer"]["frame_indices"].append(batch["frame_indices"][b, :valid_len])
-        state["active_buffer"]["starts"].append(int(batch["start_idx"][b]))
+
+        if state["active_episode_idx"] is not None and episode_idx != state["active_episode_idx"]:
+            state["encoded_episodes"] += 1
+            state["encoded_frames"]   += state["active_step_pos"]
+            state["active_step_pos"]   = 0
+
+        state["active_episode_idx"] = episode_idx
+        if valid_len == 0:
+            return  # corrupted window — step_pos not advanced, gap left in episode
+        episode_len = len(dataset.episode_plans[episode_idx]["indices"])
+        sample_idx  = int(dataset.episode_plans[episode_idx]["sample_idx"])
+
+        for t in range(valid_len):
+            row = {
+                **{f"tokens_{view}": tokens_by_view[view][b, t].copy() for view in views},
+                "actions":       batch["actions"][b, t].copy(),
+                "states":        batch["states"][b, t].copy(),
+                "cam_rel_poses": batch["cam_rel_poses"][b, t].copy(),
+                "frame_index":   int(batch["frame_indices"][b, t]),
+                "episode_idx":   episode_idx,
+                "sample_idx":    sample_idx,
+                "step_pos":      state["active_step_pos"],
+                "episode_len":   episode_len,
+            }
+            while True:
+                try:
+                    write_queue.put(row, timeout=1.0)
+                    break
+                except queue.Full:
+                    if not writer_alive.is_set():
+                        raise RuntimeError("MDS writer thread died unexpectedly")
+            state["active_step_pos"] += 1

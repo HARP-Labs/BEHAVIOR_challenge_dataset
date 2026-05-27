@@ -1,5 +1,6 @@
 meta:
   dtype: bfloat16
+  compile: true
 
 model:
   backend: hf
@@ -8,10 +9,10 @@ model:
 
 data:
   datasets:
-    - /content/base_dataset/manifest.json
+    - /workspace/base_dataset/manifest.json
   dataset_fpcs:
-    - 8
-  batch_size: 1
+    - 32
+  batch_size: 4
   fps: 5
   crop_size: 256
   num_workers: 8
@@ -19,10 +20,10 @@ data:
   prefetch_factor: 4
   pin_mem: true
   camera_view: multi  # "head" or "multi" (head + left_wrist + right_wrist)
-  # state_dim is fixed at 133 by BehaviorVideoDataset.PROPRIO_SLICES — not configurable here
   action_dim: 23
-  cache_parquet: false
+  cache_parquet: true
   cache_video_readers: false
+  cache_max_entries: 12
 
 data_aug:
   auto_augment: false
@@ -37,7 +38,12 @@ data_aug:
   reprob: 0.0
 
 output:
-  local_output_dir:
-  hf_repo_id: quastAI/behavior2025-vjepa2-vitg-130h-demo-embeddings
+  local_output_dir: /workspace/shards_256px_vit_16_g
+  hf_repo_id: 
   hf_path_prefix: shards_256px_vit_16_g
-  max_shard_bytes: 1073741824  # 1 GiB
+  max_shard_bytes: 536870912   # 512 MiB — standard MDS range; Colab→HF bandwidth is not the bottleneck
+  commit_batch_size: 10        # 10 × 512 MiB = 5 GiB per commit; at 200 shards/hr = 20 commits/hr (well under 128/hr limit)
+  num_upload_workers: 4        # S3 parallelism via preupload_lfs_files; commits are serialized
+  max_pending_shards:        # truly idle shards (excludes in-flight); cap on disk backlog
+  upload_timeout: 600          # seconds before a stalled socket raises and triggers retry
+  write_queue_depth: 256       # max rows queued between GPU encoder and MDS writer thread (~2 MB/row for multi-view ViT-G)

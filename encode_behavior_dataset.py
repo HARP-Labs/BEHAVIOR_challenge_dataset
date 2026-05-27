@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import ctypes
+import gc
 import importlib
 import os
 import torch
@@ -36,9 +38,14 @@ class NativeVJEPA21Encoder(torch.nn.Module):
 class HFVJEPA2Encoder(torch.nn.Module):
     """Wrapper exposing HF V-JEPA2 encoder features as a plain tensor."""
 
-    def __init__(self, hf_repo_id: str, temporal_patch_size: int = 2):
+    def __init__(self, hf_repo_id: str, temporal_patch_size: int = 2, torch_dtype=None, device=None):
         super().__init__()
-        self.model = AutoModel.from_pretrained(hf_repo_id)
+        kwargs: dict = {"dtype": torch_dtype, "low_cpu_mem_usage": True}
+        if device is not None and str(device) != "cpu":
+            # Load weights directly onto the target device — no CPU copy is ever
+            # created, so there is nothing to free before DataLoader worker fork.
+            kwargs["device_map"] = {"": str(device)}
+        self.model = AutoModel.from_pretrained(hf_repo_id, **kwargs)
         self._temporal_patch_size_fallback = temporal_patch_size
 
     @property
@@ -64,7 +71,7 @@ class HFVJEPA2Encoder(torch.nn.Module):
         return outputs.last_hidden_state
 
 
-def _build_encoder(model_cfg: dict) -> torch.nn.Module:
+def _build_encoder(model_cfg: dict, torch_dtype=None, device=None) -> torch.nn.Module:
     backend = model_cfg.get("backend", "hf")
     if backend == "native_vjepa21":
         model_name = model_cfg.get("model_name", "vjepa2_1_vit_giant_384")
@@ -73,7 +80,12 @@ def _build_encoder(model_cfg: dict) -> torch.nn.Module:
     else:
         hf_repo_id = model_cfg.get("hf_repo", "facebook/vjepa2-vitg-fpc64-256")
         temporal_patch_size = model_cfg.get("temporal_patch_size", 2)
-        return HFVJEPA2Encoder(hf_repo_id=hf_repo_id, temporal_patch_size=temporal_patch_size)
+        return HFVJEPA2Encoder(
+            hf_repo_id=hf_repo_id,
+            temporal_patch_size=temporal_patch_size,
+            torch_dtype=torch_dtype,
+            device=device,
+        )
 
 
 def main(cfg_path: str):
@@ -87,8 +99,24 @@ def main(cfg_path: str):
     dtype_name = meta_cfg.get("dtype", "float32").lower()
     dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
 
-    encoder = _build_encoder(model_cfg).to(device)
+    # HF backend: device_map loads weights directly onto the target device,
+    # so no CPU copy is ever created. The .to() call is a no-op for that path
+    # but still needed for native_vjepa21 (which loads to CPU first).
+    encoder = _build_encoder(model_cfg, torch_dtype=dtype, device=device).to(device=device, dtype=dtype)
+    if meta_cfg.get("compile", True) and device.type == "cuda":
+        encoder = torch.compile(encoder, mode="reduce-overhead")
+
+    # Clean up any residual CPU allocations (Python object pools, small sbrk
+    # fragments from loading metadata) before DataLoader forks workers.
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except OSError:
+        pass  # non-Linux (macOS, Windows) — malloc_trim not available
     print(f"backend={model_cfg.get('backend', 'hf')}  temporal_patch_size={encoder.temporal_patch_size}")
 
     transform = make_transforms(
@@ -109,6 +137,7 @@ def main(cfg_path: str):
         action_dim=data_cfg.get("action_dim", 23),
         cache_parquet=data_cfg.get("cache_parquet", False),
         cache_video_readers=data_cfg.get("cache_video_readers", False),
+        cache_max_entries=data_cfg.get("cache_max_entries", 12),
     )
 
     preencoder = BehaviorEpisodePreencoder(
@@ -131,6 +160,11 @@ def main(cfg_path: str):
         pin_memory=data_cfg.get("pin_mem", True),
         persistent_workers=data_cfg.get("persistent_workers", True),
         prefetch_factor=data_cfg.get("prefetch_factor", 2),
+        commit_batch_size=out_cfg.get("commit_batch_size", 20),
+        num_upload_workers=out_cfg.get("num_upload_workers", 1),
+        max_pending_shards=out_cfg.get("max_pending_shards"),
+        upload_timeout=out_cfg.get("upload_timeout", 600),
+        write_queue_depth=out_cfg.get("write_queue_depth", 256),
     )
 
 
